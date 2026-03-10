@@ -428,7 +428,7 @@ function GHGBar({ label, value, max = 10 }) {
 
 // ─── Main Application ─────────────────────────────────────────────────────────
 
-export default function SAFManager() {
+export default function SAFManager({ onLogout, userEmail }) {
   const [certs, setCerts] = useState([]);
   const [selected, setSelected] = useState(null);
   const [invoices, setInvoices] = useState([]);
@@ -724,17 +724,27 @@ export default function SAFManager() {
         .from("certificates-pdf").download(cert.pdfPath);
       if (dlErr) throw new Error(`Storage download: ${dlErr.message}`);
       const b64 = await blobToBase64(blob);
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: ANTHROPIC_HEADERS,
-        body: JSON.stringify({
-          model: ANTHROPIC_MODEL, max_tokens: 4096,
-          messages: [{ role: "user", content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-            { type: "text", text: EXTRACT_PROMPT }
-          ]}]
-        })
-      });
+      // Retry with exponential backoff on 429
+      let attempt = 0;
+      let res;
+      while (attempt < 4) {
+        res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: ANTHROPIC_HEADERS,
+          body: JSON.stringify({
+            model: ANTHROPIC_MODEL, max_tokens: 4096,
+            messages: [{ role: "user", content: [
+              { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+              { type: "text", text: EXTRACT_PROMPT }
+            ]}]
+          })
+        });
+        if (res.status !== 429) break;
+        const delay = Math.pow(2, attempt) * 5000;
+        addLog(`⏳ Rate limited, retrying in ${delay / 1000}s…`, "info");
+        await new Promise(r => setTimeout(r, delay));
+        attempt++;
+      }
       const data = await res.json();
       if (!res.ok) throw new Error(`API error ${res.status}: ${data.error?.message}`);
       const text = data.content?.map(b => b.text || "").join("") || "{}";
@@ -750,6 +760,123 @@ export default function SAFManager() {
     }
     setLoading("");
   }, [certs]);
+
+  const syncBucket = useCallback(async () => {
+    setLoading("Listing bucket files...");
+    addLog("↺ Syncing bucket → DB…", "info");
+
+    // List all files in the bucket (paginate in chunks of 1000)
+    const allFiles = [];
+    const PAGE = 1000;
+    // Recursively list a folder and collect PDF entries
+    const listFolder = async (prefix) => {
+      let offset = 0;
+      while (true) {
+        const { data: page, error } = await supabase.storage
+          .from("certificates-pdf").list(prefix || null, { limit: PAGE, offset, sortBy: { column: "name", order: "asc" } });
+        if (error) { addLog(`✗ Bucket list error (${prefix || "root"}): ${error.message}`, "error"); return false; }
+        if (!page?.length) break;
+        for (const f of page) {
+          const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
+          if (f.id === null) {
+            // It's a virtual folder — recurse into it
+            const ok = await listFolder(fullPath);
+            if (!ok) return false;
+          } else if (f.name.toLowerCase().endsWith(".pdf")) {
+            allFiles.push({ ...f, name: fullPath });
+          }
+        }
+        if (page.length < PAGE) break;
+        offset += PAGE;
+      }
+      return true;
+    };
+    const ok = await listFolder(null);
+    if (!ok) { setLoading(""); return; }
+    addLog(`↳ ${allFiles.length} PDF file(s) found in bucket`, "info");
+
+    // Load all known pdf_paths from DB
+    const { data: dbRows } = await supabase.from("certificates").select("pdf_path");
+    const knownPaths = new Set((dbRows || []).map(r => r.pdf_path).filter(Boolean));
+
+    const orphans = allFiles.filter(f => !knownPaths.has(f.name));
+    addLog(`Found ${allFiles.length} bucket file(s), ${orphans.length} not yet in DB`, "info");
+
+    if (!orphans.length) { addLog("✓ All bucket files already in DB", "success"); setLoading(""); return; }
+
+    let done = 0;
+    for (const file of orphans) {
+      const pdfPath = file.name;
+      setLoading(`Syncing ${done + 1}/${orphans.length}: ${pdfPath}`);
+      try {
+        const { data: blob, error: dlErr } = await supabase.storage.from("certificates-pdf").download(pdfPath);
+        if (dlErr) throw new Error(`Download: ${dlErr.message}`);
+        const b64 = await blobToBase64(blob);
+
+        // Call Claude with retry on 429
+        let attempt = 0, res;
+        while (attempt < 5) {
+          res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: ANTHROPIC_HEADERS,
+            body: JSON.stringify({
+              model: ANTHROPIC_MODEL, max_tokens: 4096,
+              messages: [{ role: "user", content: [
+                { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
+                { type: "text", text: EXTRACT_PROMPT }
+              ]}]
+            })
+          });
+          if (res.status !== 429) break;
+          const delay = Math.pow(2, attempt) * 5000;
+          addLog(`⏳ Rate limited, retrying in ${delay / 1000}s…`, "info");
+          await new Promise(r => setTimeout(r, delay));
+          attempt++;
+        }
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(`API error ${res.status}: ${data.error?.message}`);
+        const text = data.content?.map(b => b.text || "").join("") || "{}";
+        let parsed = {};
+        try { parsed = normalizeCommaDecimals(JSON.parse(text.replace(/```json|```/g, "").trim())); }
+        catch (e) { addLog(`⚠ Parse error for ${pdfPath}: ${e.message}`, "error"); }
+
+        const uniqueNumber = parsed.uniqueNumber || null;
+        const filename = pdfPath.split("/").pop();
+
+        let saved, dbErr;
+        if (uniqueNumber) {
+          ({ data: saved, error: dbErr } = await supabase.from("certificates")
+            .insert({ filename, data: parsed, unique_number: uniqueNumber, pdf_path: pdfPath })
+            .select("id").single());
+          if (dbErr?.code === "23505") {
+            // Already exists by unique_number — just update pdf_path + data
+            ({ data: saved, error: dbErr } = await supabase.from("certificates")
+              .update({ data: parsed, pdf_path: pdfPath })
+              .eq("unique_number", uniqueNumber)
+              .select("id").single());
+          }
+        } else {
+          ({ data: saved, error: dbErr } = await supabase.from("certificates")
+            .insert({ filename, data: parsed, pdf_path: pdfPath })
+            .select("id").single());
+        }
+
+        if (dbErr) addLog(`⚠ DB error for ${pdfPath}: ${dbErr.message}`, "error");
+        else addLog(`✓ [${done + 1}/${orphans.length}] ${parsed.uniqueNumber || filename}`, "success");
+      } catch (e) {
+        addLog(`✗ [${done + 1}/${orphans.length}] ${pdfPath}: ${e.message}`, "error");
+      }
+      done++;
+      // Pause between calls to stay under 30k tokens/min rate limit
+      if (done < orphans.length) await new Promise(r => setTimeout(r, 4000));
+    }
+
+    addLog(`✓ Sync complete — ${done} file(s) processed`, "success");
+    setLoading("Reloading DB…");
+    await loadFromDB();
+    setLoading("");
+  }, [loadFromDB]);
 
   const exportXLSX = useCallback(async () => {
     // Build CSV-like export data
@@ -841,7 +968,21 @@ export default function SAFManager() {
             </div>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {userEmail && (
+            <span style={{ fontFamily: "'Space Mono',monospace", fontSize: 10, color: "#4a7fa0", letterSpacing: 1 }}>
+              {userEmail}
+            </span>
+          )}
+          {onLogout && (
+            <button className="btn" onClick={onLogout} style={{
+              background: "transparent", color: "#4a7fa0", padding: "5px 12px",
+              borderRadius: 5, fontFamily: "'Space Mono',monospace", fontSize: 10,
+              letterSpacing: 1, border: "1px solid #0d3060", cursor: "pointer"
+            }}>
+              SIGN OUT
+            </button>
+          )}
           {loading && (
             <div style={{
               color: loading.startsWith("[2/2]") ? "#aa00ff" : "#00bfff",
@@ -894,12 +1035,26 @@ export default function SAFManager() {
           🔄 RELOAD DB
         </button>
 
+        <button className="btn" onClick={syncBucket} style={{
+          background: "#0a1628", color: "#f0c040", padding: "7px 14px", borderRadius: 6,
+          fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
+          border: "1px solid #403010"
+        }}>
+          ☁ SYNC BUCKET
+        </button>
+
         <div style={{ flex: 1 }} />
 
         {certs.length > 0 && (
           <>
             {certs.some(c => c.pdfPath) && (
-              <button className="btn" onClick={() => certs.forEach((_, i) => reExtractCert(i))} style={{
+              <button className="btn" onClick={async () => {
+                for (let i = 0; i < certs.length; i++) {
+                  if (!certs[i]?.pdfPath) continue;
+                  await reExtractCert(i);
+                  if (i < certs.length - 1) await new Promise(r => setTimeout(r, 3000));
+                }
+              }} style={{
                 background: "#001428", color: "#4a9fd4", padding: "7px 16px", borderRadius: 6,
                 fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
                 border: "1px solid #0d3060"
