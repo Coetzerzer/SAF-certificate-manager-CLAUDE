@@ -1,13 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./src/supabase.js";
 
-const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
-const ANTHROPIC_HEADERS = {
-  "Content-Type": "application/json",
-  "x-api-key": import.meta.env.VITE_ANTHROPIC_KEY,
-  "anthropic-version": "2023-06-01",
-  "anthropic-dangerous-direct-browser-access": "true",
-};
+const EXTRACTION_FUNCTION = "extract-certificate";
 
 const MATCH_TOLERANCE = 0.002;
 const MAX_COMBINATION_SIZE = 6;
@@ -31,83 +25,6 @@ const NUMERIC_FIELDS = [
   "lcv",
   "density",
 ];
-
-const EXTRACT_PROMPT = `You are an expert in SAF (Sustainable Aviation Fuel) certification documents.
-Extract ALL of the following fields from this certificate PDF. Return ONLY a valid JSON object with these exact keys:
-
-{
-  "docType": "PoS (Proof of Sustainability) or PoC (Proof of Compliance) — PoC is an umbrella certificate referencing underlying PoS batches",
-  "uniqueNumber": "",
-  "dateIssuance": "",
-  "issuer": "the entity that issued/signed this document",
-  "issuerAddress": "",
-  "issuerCertNumber": "certification number of the issuer",
-  "safSupplier": "the actual SAF producer/supplier — may differ from issuer on PoC docs (look for 'underlying supplier', 'SAF producer', or the PoS holder name)",
-  "safSupplierAddress": "",
-  "recipient": "buyer / consignee",
-  "recipientAddress": "",
-  "contractNumber": "all contract references found (comma-separated if multiple, e.g. LMT21482_1576, LMT22430_1576)",
-  "dispatchAddress": "",
-  "receiptAddress": "",
-  "supplyPeriod": "for PoC: the full supply period, e.g. '01/01/2025 – 31/12/2025'",
-  "dateDispatch": "for PoS: the actual dispatch date; leave empty for PoC",
-  "physicalDeliveryAirport": "ICAO or name of the main physical delivery airport",
-  "deliveryAirports": "all delivery airports listed (comma-separated ICAO/IATA codes)",
-  "productType": "",
-  "rawMaterial": "",
-  "rawMaterialOrigin": "",
-  "quantity": "for PoS: the SAF quantity. For PoC: the bio/SAF component quantity (NOT the total fossil+bio volume)",
-  "totalVolume": "for PoC only: total physical JET A-1 volume including fossil component",
-  "quantityUnit": "m3, litres, MT, etc.",
-  "energyContent": "",
-  "euRedCompliant": "",
-  "isccCompliant": "",
-  "chainOfCustody": "",
-  "productionCountry": "",
-  "productionStartDate": "",
-  "ghgTotal": "weighted average GHG intensity (gCO2eq/MJ) — compute weighted average if multiple batches",
-  "ghgSaving": "weighted average GHG saving % vs fossil reference — compute weighted average if multiple batches",
-  "ghgEec": "",
-  "ghgEl": "",
-  "ghgEp": "",
-  "ghgEtd": "",
-  "ghgEu": "",
-  "ghgEsca": "",
-  "ghgEccs": "",
-  "ghgEccr": "",
-  "wasteResidueCompliant": "",
-  "sustainabilityCriteria": "",
-  "certificationScheme": "",
-  "complianceScheme": "",
-  "underlyingPoSList": [
-    {
-      "poSNumber": "e.g. LUD_25_12_053",
-      "rawMaterial": "",
-      "origin": "country of origin of raw material",
-      "ghgTotal": "",
-      "ghgSaving": "",
-      "quantity": "",
-      "quantityUnit": ""
-    }
-  ],
-  "isComplexPoC": "true if PoC covering 3+ airports with a table of monthly volumes",
-  "monthlyVolumes": [{ "month": "YYYY-MM", "airport": "ICAO/IATA", "quantity": "", "quantityUnit": "" }],
-  "airportVolumes": [{ "airport": "ICAO/IATA", "country": "", "quantity": "", "quantityUnit": "" }],
-  "safType": "e.g. HEFA, AtJ, FT",
-  "lcv": "",
-  "density": ""
-}
-
-IMPORTANT RULES:
-- underlyingPoSList should be an array of objects (one per underlying PoS batch). If only one batch or a PoS doc, still use the array format with one entry.
-- On a PoC, "quantity" must be the bio/SAF volume only, NOT the total blended JET A-1 volume.
-- contractNumber: capture ALL contract references (look for EXTRANET refs, LMT numbers, contract IDs).
-- isComplexPoC: set to "true" if this is a PoC covering 3 or more airports with a breakdown table of volumes per month. Otherwise "false" or "".
-- monthlyVolumes: if the document contains a table with volumes broken down by month AND airport, extract each row as an entry with "month" (YYYY-MM), "airport" (ICAO or IATA code), "quantity", "quantityUnit". Leave as [] if no such table exists.
-- airportVolumes: if the document lists volumes per airport (but not per month), extract each row with "airport", "country", "quantity", "quantityUnit". Leave as [] if not present.
-- If a field is not present, use empty string "" (or empty array [] for underlyingPoSList/monthlyVolumes/airportVolumes).
-- NUMBERS: always use a dot "." as the decimal separator, never a comma. E.g. write 5.599 not 5,599 — even if the source document uses European comma-decimal formatting.
-- Return ONLY the JSON, no markdown, no explanation.`;
 
 const INVOICE_HEADER_ALIASES = {
   invoice_no: ["invoice no", "invoice_no", "invoice"],
@@ -195,7 +112,11 @@ function dateInRange(dateStr, range) {
 }
 
 function parseDateRange(cert) {
-  if (cert?.supplyPeriod) {
+  const docType = String(cert?.docType || "").toLowerCase();
+  const isPoC = docType.includes("poc") || docType.includes("proof of compliance");
+  const isPoS = docType.includes("pos") || docType.includes("proof of sustainability");
+
+  if (isPoC && cert?.supplyPeriod) {
     const parts = cert.supplyPeriod.split(/[\u2013\u2014\-–]+/).map((part) => part.trim());
     if (parts.length >= 2) {
       const start = parseDateValue(parts[0]);
@@ -203,11 +124,25 @@ function parseDateRange(cert) {
       if (start && end) return { start, end };
     }
   }
-  if (cert?.dateDispatch) {
+
+  if (isPoS && cert?.dateDispatch) {
     const sameDay = parseDateValue(cert.dateDispatch);
     if (sameDay) return { start: sameDay, end: sameDay };
   }
+
+  if (!isPoC && !isPoS && cert?.dateDispatch) {
+    const sameDay = parseDateValue(cert.dateDispatch);
+    if (sameDay) return { start: sameDay, end: sameDay };
+  }
+
   return null;
+}
+
+function formatDateRangeLabel(range) {
+  if (!range?.start || !range?.end) return "";
+  const start = range.start.toISOString().slice(0, 10);
+  const end = range.end.toISOString().slice(0, 10);
+  return start === end ? start : `${start} to ${end}`;
 }
 
 function splitRefs(value) {
@@ -358,35 +293,24 @@ function blobToBase64(blob) {
   });
 }
 
-async function extractCertificateFromBase64(base64) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: ANTHROPIC_HEADERS,
-    body: JSON.stringify({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 4096,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "document",
-              source: { type: "base64", media_type: "application/pdf", data: base64 },
-            },
-            { type: "text", text: EXTRACT_PROMPT },
-          ],
-        },
-      ],
-    }),
+async function extractCertificateFromBase64(base64, filename) {
+  const { data, error } = await supabase.functions.invoke(EXTRACTION_FUNCTION, {
+    body: { base64, filename },
   });
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`API error ${res.status}: ${data.error?.message || JSON.stringify(data)}`);
+  if (error) {
+    throw new Error(error.message || "Edge function invocation failed.");
   }
-  const text = data.content?.map((block) => block.text || "").join("") || "{}";
-  const clean = text.replace(/```json|```/g, "").trim();
-  return normalizeCommaDecimals(JSON.parse(clean));
+  if (!data?.parsed) {
+    throw new Error(data?.error || "Extraction function returned no parsed certificate.");
+  }
+
+  return {
+    parsed: normalizeCommaDecimals(data.parsed),
+    model: data.model || "gpt-5-mini",
+    usage: data.usage || null,
+    responseId: data.response_id || null,
+  };
 }
 
 function isMissingTableError(error) {
@@ -565,7 +489,42 @@ function buildDeterministicMatch(certData, invoiceRows) {
     (row) => !row.is_allocated && Number.isFinite(Number(row.vol_m3)) && Number(row.vol_m3) > 0
   );
 
-  const signals = new Map(availableRows.map((row) => [row.id, scoreInvoiceRow(row, criteria)]));
+  const dateValidatedRows = criteria.dateRange
+    ? availableRows.filter((row) => dateInRange(row.uplift_date, criteria.dateRange))
+    : availableRows;
+
+  if (criteria.dateRange && !dateValidatedRows.length) {
+    return {
+      status: "unmatched",
+      match_method: "date-validated",
+      cert_volume_m3: criteria.targetVolume,
+      allocated_volume_m3: 0,
+      variance_m3: criteria.targetVolume,
+      review_note: `No free invoice rows fall on the required uplift date / supply period (${formatDateRangeLabel(criteria.dateRange)}).`,
+      candidate_sets: [],
+      linked_rows: [],
+    };
+  }
+
+  const dateValidatedSignals = new Map(dateValidatedRows.map((row) => [row.id, scoreInvoiceRow(row, criteria)]));
+  const airportValidatedRows = criteria.airports.size
+    ? dateValidatedRows.filter((row) => dateValidatedSignals.get(row.id)?.airportMatch)
+    : dateValidatedRows;
+
+  if (criteria.airports.size && !airportValidatedRows.length) {
+    return {
+      status: "unmatched",
+      match_method: "airport-validated",
+      cert_volume_m3: criteria.targetVolume,
+      allocated_volume_m3: 0,
+      variance_m3: criteria.targetVolume,
+      review_note: `No free invoice rows match the required airport(s) ${[...criteria.airports].join(", ")}${criteria.dateRange ? ` on ${formatDateRangeLabel(criteria.dateRange)}` : ""}.`,
+      candidate_sets: [],
+      linked_rows: [],
+    };
+  }
+
+  const signals = new Map(airportValidatedRows.map((row) => [row.id, scoreInvoiceRow(row, criteria)]));
 
   const pools = [];
   const pushPool = (rows, label, priority) => {
@@ -573,33 +532,33 @@ function buildDeterministicMatch(certData, invoiceRows) {
     pools.push({ rows, label, priority });
   };
 
-  const exactSingles = availableRows.filter(
+  const exactSingles = airportValidatedRows.filter(
     (row) => Math.abs(Number(row.vol_m3) - criteria.targetVolume) <= MATCH_TOLERANCE
   );
   pushPool(exactSingles, "exact-single-row", 9);
 
   if (criteria.contractRefs.length) {
-    pushPool(availableRows.filter((row) => signals.get(row.id)?.contractMatch), "contract-ref", 8);
+    pushPool(airportValidatedRows.filter((row) => signals.get(row.id)?.contractMatch), "contract-ref", 8);
   }
   if (criteria.airports.size && criteria.dateRange) {
     pushPool(
-      availableRows.filter((row) => signals.get(row.id)?.airportMatch && signals.get(row.id)?.dateMatch),
+      airportValidatedRows.filter((row) => signals.get(row.id)?.airportMatch && signals.get(row.id)?.dateMatch),
       "airport+date",
       7
     );
   }
   if (criteria.airports.size) {
-    pushPool(availableRows.filter((row) => signals.get(row.id)?.airportMatch), "airport", 6);
+    pushPool(airportValidatedRows.filter((row) => signals.get(row.id)?.airportMatch), "airport", 6);
   }
   if (criteria.dateRange) {
-    pushPool(availableRows.filter((row) => signals.get(row.id)?.dateMatch), "date", 5);
+    pushPool(airportValidatedRows.filter((row) => signals.get(row.id)?.dateMatch), "date", 5);
   }
   if (criteria.recipientTokens.length) {
-    pushPool(availableRows.filter((row) => signals.get(row.id)?.customerMatch), "customer", 4);
+    pushPool(airportValidatedRows.filter((row) => signals.get(row.id)?.customerMatch), "customer", 4);
   }
 
   pushPool(
-    [...availableRows].sort((a, b) => {
+    [...airportValidatedRows].sort((a, b) => {
       const scoreDiff = (signals.get(b.id)?.score || 0) - (signals.get(a.id)?.score || 0);
       if (scoreDiff !== 0) return scoreDiff;
       return Math.abs(criteria.targetVolume - Number(a.vol_m3)) - Math.abs(criteria.targetVolume - Number(b.vol_m3));
@@ -633,7 +592,7 @@ function buildDeterministicMatch(certData, invoiceRows) {
       cert_volume_m3: criteria.targetVolume,
       allocated_volume_m3: 0,
       variance_m3: criteria.targetVolume,
-      review_note: `No free invoice row group matches ${formatVolume(criteria.targetVolume)} m3 within ${MATCH_TOLERANCE} m3.`,
+      review_note: `No free invoice row group matches ${formatVolume(criteria.targetVolume)} m3 within ${MATCH_TOLERANCE} m3${criteria.dateRange ? ` on ${formatDateRangeLabel(criteria.dateRange)}` : ""}.`,
       candidate_sets: [],
       linked_rows: [],
     };
@@ -647,7 +606,7 @@ function buildDeterministicMatch(certData, invoiceRows) {
       cert_volume_m3: criteria.targetVolume,
       allocated_volume_m3: winner.total_volume_m3,
       variance_m3: winner.variance_m3,
-      review_note: `Unique deterministic match found using ${winner.match_method}.`,
+      review_note: `Unique deterministic match found using ${winner.match_method}${criteria.dateRange ? ` with uplift date validation (${formatDateRangeLabel(criteria.dateRange)})` : ""}.`,
       candidate_sets: [winner],
       linked_rows: winner.rows,
     };
@@ -660,7 +619,7 @@ function buildDeterministicMatch(certData, invoiceRows) {
     cert_volume_m3: criteria.targetVolume,
     allocated_volume_m3: topCandidates[0].total_volume_m3,
     variance_m3: topCandidates[0].variance_m3,
-    review_note: `${candidates.length} valid invoice groups match ${formatVolume(criteria.targetVolume)} m3. Manual approval required.`,
+    review_note: `${candidates.length} valid invoice groups match ${formatVolume(criteria.targetVolume)} m3${criteria.dateRange ? ` with uplift date validation (${formatDateRangeLabel(criteria.dateRange)})` : ""}. Manual approval required.`,
     candidate_sets: topCandidates,
     linked_rows: [],
   };
@@ -1070,7 +1029,8 @@ export default function SAFManager({ onLogout, userEmail }) {
         addLog(`Processing ${file.name}`, "info");
         try {
           const base64 = await fileToBase64(file);
-          const parsed = await extractCertificateFromBase64(base64);
+          const extraction = await extractCertificateFromBase64(base64, file.name);
+          const parsed = extraction.parsed;
           const uniqueNumber = parsed.uniqueNumber || null;
           const storagePath = uniqueNumber ? `${uniqueNumber}.pdf` : `no-id/${Date.now()}-${file.name}`;
 
@@ -1103,6 +1063,12 @@ export default function SAFManager({ onLogout, userEmail }) {
           }
           if (saveRes.error) throw saveRes.error;
           addLog(`Saved ${certTitle({ filename: file.name, data: parsed })}`, "success");
+          if (extraction.usage) {
+            addLog(
+              `Extracted with ${extraction.model} (${extraction.usage.input_tokens || 0} in / ${extraction.usage.output_tokens || 0} out tokens)`,
+              "info"
+            );
+          }
         } catch (error) {
           addLog(`Certificate import failed for ${file.name}: ${error.message}`, "error");
         }
@@ -1220,12 +1186,19 @@ export default function SAFManager({ onLogout, userEmail }) {
         const { data: blob, error: dlErr } = await supabase.storage.from("certificates-pdf").download(cert.pdfPath);
         if (dlErr) throw dlErr;
         const base64 = await blobToBase64(blob);
-        const parsed = await extractCertificateFromBase64(base64);
+        const extraction = await extractCertificateFromBase64(base64, cert.filename || `${certTitle(cert)}.pdf`);
+        const parsed = extraction.parsed;
 
         const { error: updateErr } = await supabase.from("certificates").update({ data: parsed }).eq("id", cert.id);
         if (updateErr) throw updateErr;
 
         addLog(`Re-extracted ${certTitle({ ...cert, data: parsed })}`, "success");
+        if (extraction.usage) {
+          addLog(
+            `Re-extracted with ${extraction.model} (${extraction.usage.input_tokens || 0} in / ${extraction.usage.output_tokens || 0} out tokens)`,
+            "info"
+          );
+        }
         setLoading("");
         await loadFromDB();
       } catch (error) {
