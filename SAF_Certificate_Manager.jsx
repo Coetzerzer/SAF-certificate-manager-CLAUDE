@@ -1,8 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./src/supabase.js";
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const ANTHROPIC_HEADERS = {
   "Content-Type": "application/json",
@@ -11,75 +9,29 @@ const ANTHROPIC_HEADERS = {
   "anthropic-dangerous-direct-browser-access": "true",
 };
 
-async function callClaude(messages, systemPrompt = "", maxTokens = 2048) {
-  const body = {
-    model: ANTHROPIC_MODEL,
-    max_tokens: maxTokens,
-    messages,
-  };
-  if (systemPrompt) body.system = systemPrompt;
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: ANTHROPIC_HEADERS,
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  return data.content?.map((b) => b.text || "").join("") || "";
-}
+const MATCH_TOLERANCE = 0.002;
+const MAX_COMBINATION_SIZE = 6;
+const MAX_SEARCH_RESULTS = 8;
+const MAX_POOL_SIZE = 28;
 
-function fileToBase64(file) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result.split(",")[1]);
-    r.onerror = () => rej(new Error("Read failed"));
-    r.readAsDataURL(file);
-  });
-}
+const NUMERIC_FIELDS = [
+  "quantity",
+  "totalVolume",
+  "ghgTotal",
+  "ghgSaving",
+  "ghgEec",
+  "ghgEl",
+  "ghgEp",
+  "ghgEtd",
+  "ghgEu",
+  "ghgEsca",
+  "ghgEccs",
+  "ghgEccr",
+  "energyContent",
+  "lcv",
+  "density",
+];
 
-function blobToBase64(blob) {
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(r.result.split(",")[1]);
-    r.onerror = () => rej(new Error("Read failed"));
-    r.readAsDataURL(blob);
-  });
-}
-
-function csvToRows(text) {
-  const lines = text.trim().split("\n");
-  if (!lines.length) return [];
-  const headers = lines[0].split(",").map((h) => h.trim().replace(/^"|"$/g, ""));
-  return lines.slice(1).map((line) => {
-    const vals = line.split(",").map((v) => v.trim().replace(/^"|"$/g, ""));
-    const obj = {};
-    headers.forEach((h, i) => (obj[h] = vals[i] ?? ""));
-    return obj;
-  });
-}
-
-// Normalize European comma-decimals (e.g. "4,2" → "4.2", "95,5%" → "95.5%")
-// Only converts values that look like numbers with a comma decimal (not thousands separators).
-const NUMERIC_FIELDS = ["quantity","totalVolume","ghgTotal","ghgSaving","ghgEec","ghgEl","ghgEp","ghgEtd","ghgEu","ghgEsca","ghgEccs","ghgEccr","energyContent","lcv","density"];
-function normalizeCommaDecimals(parsed) {
-  const fix = (v) => {
-    if (typeof v !== "string") return v;
-    // Match: optional digits, a comma, exactly 1-3 digits, optional % — but NOT a thousands separator (which would have 3 digits after comma followed by more digits)
-    return v.replace(/^(-?\d+),(\d{1,3})(%?)$/, (_, int, dec, pct) => `${int}.${dec}${pct}`);
-  };
-  const out = { ...parsed };
-  for (const f of NUMERIC_FIELDS) { if (out[f]) out[f] = fix(out[f]); }
-  if (Array.isArray(out.underlyingPoSList)) {
-    out.underlyingPoSList = out.underlyingPoSList.map(b => ({
-      ...b,
-      ghgTotal: fix(b.ghgTotal ?? ""),
-      ghgSaving: fix(b.ghgSaving ?? ""),
-      quantity: fix(b.quantity ?? ""),
-    }));
-  }
-  return out;
-}
-
-// SAF fields to extract from PDF
 const EXTRACT_PROMPT = `You are an expert in SAF (Sustainable Aviation Fuel) certification documents.
 Extract ALL of the following fields from this certificate PDF. Return ONLY a valid JSON object with these exact keys:
 
@@ -157,779 +109,1379 @@ IMPORTANT RULES:
 - NUMBERS: always use a dot "." as the decimal separator, never a comma. E.g. write 5.599 not 5,599 — even if the source document uses European comma-decimal formatting.
 - Return ONLY the JSON, no markdown, no explanation.`;
 
-const COMPARE_PROMPT = (cert, invoices) => `You are a SAF compliance analyst at Titan Aviation Fuels SARL.
+const INVOICE_HEADER_ALIASES = {
+  invoice_no: ["invoice no", "invoice_no", "invoice"],
+  customer: ["customer"],
+  uplift_date: ["uplift date", "date"],
+  flight_no: ["flight no", "flight"],
+  delivery_ticket: ["delivery ticket", "delivery tick", "delivery", "ticket"],
+  iata: ["iata"],
+  icao: ["icao"],
+  country: ["country"],
+  supplier: ["supplier"],
+  vol_m3: ["vol in m3", "vol m3", "volume m3", "m3"],
+};
 
-INVOICE SCHEMA: Each invoice row has these columns: IATA (airport IATA code), ICAO (airport ICAO code), COUNTRY, CUSTOMER (buyer name). There may also be volume, date, or reference columns.
+function normalizeText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
-Here is an extracted SAF certificate:
-${JSON.stringify(cert, null, 2)}
+function compactText(value) {
+  return normalizeText(value).replace(/\s+/g, "");
+}
 
-Here are our internal invoice records:
-${JSON.stringify(invoices.slice(0, 300), null, 2)}
+function formatVolume(value) {
+  const num = typeof value === "number" ? value : parseFlexibleNumber(value);
+  if (!Number.isFinite(num)) return "—";
+  return num.toFixed(3).replace(/\.?0+$/, "");
+}
 
-MATCHING LOGIC:
-1. docType matters: PoC covers a supply PERIOD at multiple airports; PoS is a single shipment.
-2. Primary match: contractNumber — search invoice rows for any of the contract references in cert.contractNumber.
-3. Secondary match: airport — cert.deliveryAirports contains ICAO/IATA codes; match against IATA and ICAO columns in invoices.
-4. For PoC: the supply period (cert.supplyPeriod) may span a full year — date tolerance should be the entire period.
-5. Quantity comparison: SUM all matched invoice volumes across the entire supply period before comparing against cert.quantity. cert.quantity is the total SAF bio-component for the whole period — never compare against a single invoice row. Express the aggregated sum in the same unit as cert.quantityUnit.
-6. GHG saving threshold: EU RED II requires ≥ 65% saving for new installations. Flag if cert.ghgSaving < 65%.
-7. supplierVerified: cross-check cert.safSupplier (actual SAF producer) against known suppliers; cert.issuer may be the distributor, not the producer.
-
-Analyze and compare. Return ONLY a valid JSON:
-{
-  "matchFound": true/false,
-  "matchedInvoice": "contract ref, IATA code, or null",
-  "matchConfidence": "High/Medium/Low/None",
-  "matchReasons": ["reason 1", ...],
-  "discrepancies": ["discrepancy 1", ...],
-  "warnings": ["warning 1", ...],
-  "complianceStatus": "Compliant/Non-Compliant/Needs Review",
-  "complianceNotes": "brief summary covering docType, supplier chain, GHG, airports",
-  "ghgSavingOk": true/false,
-  "quantityMatch": true/false,
-  "supplierVerified": true/false,
-  "airportsVerified": true/false,
-  "contractRefFound": true/false,
-  "recommendedAction": "Accept / Reject / Review Manually",
-  "matchedInvoiceRows": ["row 3: LMT21482_1576 · BGY · 2025-03-15 · 145 m³", "..."]
-}`;
-
-const ATTRIBUTION_PROMPT = (cert, filteredInvoices) => `You are a SAF compliance analyst at Titan Aviation Fuels SARL.
-
-This is a complex PoC certificate covering multiple airports. Your task is to attribute the certified SAF volumes to specific customers based on our internal invoice records.
-
-CERTIFICATE DATA:
-${JSON.stringify({ uniqueNumber: cert.uniqueNumber, contractNumber: cert.contractNumber, supplyPeriod: cert.supplyPeriod, deliveryAirports: cert.deliveryAirports, monthlyVolumes: cert.monthlyVolumes, airportVolumes: cert.airportVolumes, quantity: cert.quantity, quantityUnit: cert.quantityUnit }, null, 2)}
-
-INVOICE RECORDS (pre-filtered for relevant airports and period):
-${JSON.stringify(filteredInvoices, null, 2)}
-
-ATTRIBUTION LOGIC:
-1. Match invoice rows to certificate slots (airport + month combinations from monthlyVolumes).
-2. Group invoice rows by CUSTOMER + IATA/ICAO airport code + month.
-3. For each certificate slot (airport + month), find matching invoice rows and sum their volumes. List the specific invoice rows used (cite _rowIdx and key fields: contract ref, IATA, date, volume) in the invoiceRefs array.
-4. A slot is "matched" if invoice volume is within 10% of cert volume for that slot.
-5. If monthlyVolumes is empty but airportVolumes exists, attribute by airport only (no month breakdown).
-6. certVolume and invoicedVolume should be numeric values with units from the certificate/invoices.
-
-Return ONLY a valid JSON object:
-{
-  "clientAttribution": [
-    {
-      "customer": "customer name from invoice",
-      "airport": "IATA or ICAO code",
-      "month": "YYYY-MM or null if no monthly breakdown",
-      "certVolume": "volume from cert for this slot",
-      "invoicedVolume": "sum of invoice volumes for this customer/airport/month",
-      "matched": true/false,
-      "confidence": "High/Medium/Low",
-      "invoiceRefs": ["row 3: LMT21482_1576 · BGY · 2025-03-15 · 145 m³", "..."]
+function parseFlexibleNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  let str = String(value ?? "").trim();
+  if (!str) return null;
+  str = str.replace(/\s+/g, "");
+  if (str.includes(",") && str.includes(".")) {
+    if (str.lastIndexOf(",") > str.lastIndexOf(".")) {
+      str = str.replace(/\./g, "").replace(",", ".");
+    } else {
+      str = str.replace(/,/g, "");
     }
-  ],
-  "unattributedSlots": [
-    {
-      "airport": "IATA or ICAO code",
-      "month": "YYYY-MM or null",
-      "certVolume": "cert volume for this slot",
-      "reason": "why no match was found"
+  } else if (str.includes(",")) {
+    const parts = str.split(",");
+    if (parts.length === 2 && parts[1].length <= 3) {
+      str = `${parts[0].replace(/\./g, "")}.${parts[1]}`;
+    } else {
+      str = str.replace(/,/g, "");
     }
-  ],
-  "totalAttributedVolume": "sum of all attributed volumes with unit",
-  "totalUnattributedVolume": "sum of unattributed volumes with unit",
-  "attributionStatus": "Complete/Partial/None",
-  "attributionNotes": "brief summary of attribution quality and any issues"
-}`;
-
-function filterInvoicesForCert(cert, invoices) {
-  // Build set of airport codes from the certificate
-  const airportCodes = new Set();
-  if (cert.deliveryAirports) {
-    cert.deliveryAirports.split(/[,\s]+/).forEach(c => { if (c.trim()) airportCodes.add(c.trim().toUpperCase()); });
   }
-  (cert.airportVolumes || []).forEach(av => { if (av.airport) airportCodes.add(av.airport.toUpperCase()); });
-  (cert.monthlyVolumes || []).forEach(mv => { if (mv.airport) airportCodes.add(mv.airport.toUpperCase()); });
+  str = str.replace(/[^0-9.-]/g, "");
+  if (!str || str === "-" || str === "." || str === "-.") return null;
+  const num = Number(str);
+  return Number.isFinite(num) ? num : null;
+}
 
-  // Parse supplyPeriod e.g. "01/01/2025 – 31/12/2025"
-  let periodStart = null, periodEnd = null;
-  if (cert.supplyPeriod) {
-    const parts = cert.supplyPeriod.split(/[\u2013\u2014\-–]+/).map(s => s.trim());
+function parseDateValue(value) {
+  const str = String(value ?? "").trim();
+  if (!str) return null;
+  const dmy = str.match(/^(\d{1,2})[/. -](\d{1,2})[/. -](\d{4})$/);
+  if (dmy) {
+    const date = new Date(Date.UTC(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1])));
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const ymd = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (ymd) {
+    const date = new Date(Date.UTC(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3])));
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  const parsed = new Date(str);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function toISODate(value) {
+  const date = value instanceof Date ? value : parseDateValue(value);
+  if (!date) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+function dateInRange(dateStr, range) {
+  if (!range?.start || !range?.end) return false;
+  const date = parseDateValue(dateStr);
+  if (!date) return false;
+  return date >= range.start && date <= range.end;
+}
+
+function parseDateRange(cert) {
+  if (cert?.supplyPeriod) {
+    const parts = cert.supplyPeriod.split(/[\u2013\u2014\-–]+/).map((part) => part.trim());
     if (parts.length >= 2) {
-      const parseDate = (s) => {
-        const [d, m, y] = s.split("/");
-        return y && m && d ? new Date(`${y}-${m}-${d}`) : null;
-      };
-      periodStart = parseDate(parts[0]);
-      periodEnd = parseDate(parts[1]);
+      const start = parseDateValue(parts[0]);
+      const end = parseDateValue(parts[1]);
+      if (start && end) return { start, end };
+    }
+  }
+  if (cert?.dateDispatch) {
+    const sameDay = parseDateValue(cert.dateDispatch);
+    if (sameDay) return { start: sameDay, end: sameDay };
+  }
+  return null;
+}
+
+function splitRefs(value) {
+  return String(value ?? "")
+    .split(/[,;/\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function tokenizeName(value) {
+  return normalizeText(value)
+    .split(/\s+/)
+    .filter((token) => token.length >= 4);
+}
+
+function parseCSVGrid(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === "," && !inQuotes) {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if ((char === "\n" || char === "\r") && !inQuotes) {
+      if (char === "\r" && next === "\n") i += 1;
+      row.push(field);
+      if (row.some((cell) => cell !== "")) rows.push(row);
+      row = [];
+      field = "";
+      continue;
+    }
+
+    field += char;
+  }
+
+  row.push(field);
+  if (row.some((cell) => cell !== "")) rows.push(row);
+  return rows;
+}
+
+function resolveHeader(headers, aliases) {
+  const normalized = headers.map((header) => compactText(header));
+  for (const alias of aliases) {
+    const compactAlias = compactText(alias);
+    const exactIndex = normalized.findIndex((header) => header === compactAlias);
+    if (exactIndex >= 0) return headers[exactIndex];
+  }
+  for (const alias of aliases) {
+    const compactAlias = compactText(alias);
+    const fuzzyIndex = normalized.findIndex((header) => header.includes(compactAlias));
+    if (fuzzyIndex >= 0) return headers[fuzzyIndex];
+  }
+  return null;
+}
+
+function parseInvoiceCSV(text) {
+  const grid = parseCSVGrid(text);
+  if (!grid.length) return { headers: [], rows: [], missing: Object.keys(INVOICE_HEADER_ALIASES) };
+
+  const headers = grid[0].map((header) => String(header ?? "").trim());
+  const headerMap = Object.fromEntries(
+    Object.entries(INVOICE_HEADER_ALIASES).map(([key, aliases]) => [key, resolveHeader(headers, aliases)])
+  );
+  const missing = Object.entries(headerMap)
+    .filter(([, value]) => !value)
+    .map(([key]) => key);
+
+  const rows = grid.slice(1).map((cells, index) => {
+    const raw = {};
+    headers.forEach((header, cellIndex) => {
+      raw[header] = String(cells[cellIndex] ?? "").trim();
+    });
+
+    return {
+      row_number: index + 2,
+      invoice_no: headerMap.invoice_no ? raw[headerMap.invoice_no] || "" : "",
+      customer: headerMap.customer ? raw[headerMap.customer] || "" : "",
+      uplift_date: toISODate(headerMap.uplift_date ? raw[headerMap.uplift_date] : ""),
+      flight_no: headerMap.flight_no ? raw[headerMap.flight_no] || "" : "",
+      delivery_ticket: headerMap.delivery_ticket ? raw[headerMap.delivery_ticket] || "" : "",
+      iata: headerMap.iata ? (raw[headerMap.iata] || "").toUpperCase() : "",
+      icao: headerMap.icao ? (raw[headerMap.icao] || "").toUpperCase() : "",
+      country: headerMap.country ? raw[headerMap.country] || "" : "",
+      supplier: headerMap.supplier ? raw[headerMap.supplier] || "" : "",
+      vol_m3: parseFlexibleNumber(headerMap.vol_m3 ? raw[headerMap.vol_m3] : ""),
+      raw_payload: raw,
+      is_allocated: false,
+    };
+  });
+
+  return { headers, rows, missing };
+}
+
+function normalizeCommaDecimals(parsed) {
+  const fix = (value) => {
+    if (typeof value !== "string") return value;
+    return value.replace(/^(-?\d+),(\d{1,3})(%?)$/, (_, integer, decimal, suffix) => `${integer}.${decimal}${suffix}`);
+  };
+
+  const out = { ...parsed };
+  for (const field of NUMERIC_FIELDS) {
+    if (out[field]) out[field] = fix(out[field]);
+  }
+  if (Array.isArray(out.underlyingPoSList)) {
+    out.underlyingPoSList = out.underlyingPoSList.map((batch) => ({
+      ...batch,
+      ghgTotal: fix(batch.ghgTotal ?? ""),
+      ghgSaving: fix(batch.ghgSaving ?? ""),
+      quantity: fix(batch.quantity ?? ""),
+    }));
+  }
+  return out;
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = () => reject(new Error("Read failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = () => reject(new Error("Read failed"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function extractCertificateFromBase64(base64) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: ANTHROPIC_HEADERS,
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 4096,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: base64 },
+            },
+            { type: "text", text: EXTRACT_PROMPT },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${data.error?.message || JSON.stringify(data)}`);
+  }
+  const text = data.content?.map((block) => block.text || "").join("") || "{}";
+  const clean = text.replace(/```json|```/g, "").trim();
+  return normalizeCommaDecimals(JSON.parse(clean));
+}
+
+function isMissingTableError(error) {
+  return error?.code === "42P01" || /does not exist/i.test(error?.message || "");
+}
+
+async function fetchAllPages(buildQuery, pageSize = 1000) {
+  let from = 0;
+  const allRows = [];
+
+  while (true) {
+    const { data, error } = await buildQuery(from, from + pageSize - 1);
+    if (error) return { data: null, error };
+    allRows.push(...(data || []));
+    if (!data || data.length < pageSize) break;
+    from += pageSize;
+  }
+
+  return { data: allRows, error: null };
+}
+
+function buildCertCriteria(cert) {
+  const airports = new Set();
+  splitRefs(cert?.deliveryAirports).forEach((code) => airports.add(code.toUpperCase()));
+  if (cert?.physicalDeliveryAirport) airports.add(String(cert.physicalDeliveryAirport).trim().toUpperCase());
+  (cert?.airportVolumes || []).forEach((item) => item?.airport && airports.add(String(item.airport).trim().toUpperCase()));
+  (cert?.monthlyVolumes || []).forEach((item) => item?.airport && airports.add(String(item.airport).trim().toUpperCase()));
+
+  const contractRefs = splitRefs(cert?.contractNumber).map((item) => item.toUpperCase());
+  const recipientTokens = tokenizeName(cert?.recipient);
+  const supplierTokens = tokenizeName(cert?.safSupplier || cert?.issuer);
+
+  return {
+    targetVolume: parseFlexibleNumber(cert?.quantity),
+    airports,
+    dateRange: parseDateRange(cert),
+    contractRefs,
+    recipientTokens,
+    supplierTokens,
+  };
+}
+
+function scoreInvoiceRow(row, criteria) {
+  const haystack = [
+    row.invoice_no,
+    row.delivery_ticket,
+    row.customer,
+    row.supplier,
+    row.iata,
+    row.icao,
+    ...Object.values(row.raw_payload || {}),
+  ]
+    .join(" ")
+    .toUpperCase();
+
+  const contractMatch =
+    criteria.contractRefs.length > 0 &&
+    criteria.contractRefs.some((ref) => ref && haystack.includes(ref));
+  const airportMatch =
+    criteria.airports.size > 0 &&
+    (criteria.airports.has((row.iata || "").toUpperCase()) || criteria.airports.has((row.icao || "").toUpperCase()));
+  const dateMatch = criteria.dateRange ? dateInRange(row.uplift_date, criteria.dateRange) : false;
+  const customerText = normalizeText(row.customer);
+  const supplierText = normalizeText(row.supplier);
+  const customerMatch =
+    criteria.recipientTokens.length > 0 &&
+    criteria.recipientTokens.some((token) => customerText.includes(token));
+  const supplierMatch =
+    criteria.supplierTokens.length > 0 &&
+    criteria.supplierTokens.some((token) => supplierText.includes(token));
+
+  let score = 0;
+  if (contractMatch) score += 12;
+  if (airportMatch) score += 6;
+  if (dateMatch) score += 4;
+  if (customerMatch) score += 2;
+  if (supplierMatch) score += 1;
+
+  return {
+    contractMatch,
+    airportMatch,
+    dateMatch,
+    customerMatch,
+    supplierMatch,
+    score,
+  };
+}
+
+function serializeRowSnapshot(row) {
+  return {
+    invoice_row_id: row.id,
+    row_number: row.row_number,
+    invoice_no: row.invoice_no || "",
+    customer: row.customer || "",
+    uplift_date: row.uplift_date || null,
+    iata: row.iata || "",
+    icao: row.icao || "",
+    allocated_m3: Number(row.vol_m3),
+  };
+}
+
+function buildCandidateFromRows(rows, label, signals, priority, criteria) {
+  const totalVolume = rows.reduce((sum, row) => sum + Number(row.vol_m3 || 0), 0);
+  const variance = totalVolume - criteria.targetVolume;
+  const invoiceRows = rows.map(serializeRowSnapshot);
+  const score =
+    priority * 100 +
+    rows.reduce((sum, row) => sum + (signals.get(row.id)?.score || 0), 0) -
+    Math.abs(variance) * 1000 -
+    rows.length;
+  const reasonParts = [];
+  if (label) reasonParts.push(label);
+  if (invoiceRows.some((row) => row.iata || row.icao)) reasonParts.push("row-level airport evidence");
+  return {
+    key: invoiceRows.map((row) => row.invoice_row_id).sort().join("|"),
+    match_method: label,
+    total_volume_m3: Number(totalVolume.toFixed(6)),
+    variance_m3: Number(variance.toFixed(6)),
+    rows: invoiceRows,
+    reason: reasonParts.join(" · "),
+    score,
+  };
+}
+
+function searchCandidateSets(pool, criteria, signals, label, priority) {
+  const results = [];
+  const sorted = [...pool]
+    .filter((row) => Number.isFinite(Number(row.vol_m3)) && Number(row.vol_m3) > 0 && Number(row.vol_m3) <= criteria.targetVolume + MATCH_TOLERANCE)
+    .sort((a, b) => {
+      const scoreDiff = (signals.get(b.id)?.score || 0) - (signals.get(a.id)?.score || 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      const closenessDiff =
+        Math.abs(criteria.targetVolume - Number(a.vol_m3)) - Math.abs(criteria.targetVolume - Number(b.vol_m3));
+      if (closenessDiff !== 0) return closenessDiff;
+      return (b.vol_m3 || 0) - (a.vol_m3 || 0);
+    })
+    .slice(0, MAX_POOL_SIZE);
+
+  function walk(startIndex, chosen, sum) {
+    if (results.length >= MAX_SEARCH_RESULTS) return;
+    if (chosen.length > 0 && Math.abs(sum - criteria.targetVolume) <= MATCH_TOLERANCE) {
+      results.push(buildCandidateFromRows(chosen, label, signals, priority, criteria));
+      return;
+    }
+    if (chosen.length >= MAX_COMBINATION_SIZE || sum > criteria.targetVolume + MATCH_TOLERANCE) return;
+
+    for (let index = startIndex; index < sorted.length; index += 1) {
+      const row = sorted[index];
+      const nextSum = sum + Number(row.vol_m3 || 0);
+      if (nextSum > criteria.targetVolume + MATCH_TOLERANCE) continue;
+      walk(index + 1, [...chosen, row], nextSum);
+      if (results.length >= MAX_SEARCH_RESULTS) return;
     }
   }
 
-  return invoices.filter(row => {
-    // Airport match
-    const rowIata = (row.IATA || row.iata || "").toUpperCase();
-    const rowIcao = (row.ICAO || row.icao || "").toUpperCase();
-    const airportMatch = airportCodes.size === 0 || airportCodes.has(rowIata) || airportCodes.has(rowIcao);
-    if (!airportMatch) return false;
-
-    // Date match — if no period defined or date unparseable, include the row
-    if (!periodStart || !periodEnd) return true;
-    const rawDate = row.Date || row.date || row.DATE || row["Invoice Date"] || "";
-    if (!rawDate) return true;
-    let rowDate = null;
-    // Try DD/MM/YYYY first, then ISO
-    const dmy = rawDate.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-    if (dmy) rowDate = new Date(`${dmy[3]}-${dmy[2]}-${dmy[1]}`);
-    else { rowDate = new Date(rawDate); }
-    if (isNaN(rowDate?.getTime())) return true; // unparseable → include
-    return rowDate >= periodStart && rowDate <= periodEnd;
-  }).map((row, idx) => ({ ...row, _rowIdx: idx + 1 }));
+  walk(0, [], 0);
+  return results;
 }
 
-function certIsComplex(certData) {
-  if (!certData) return false;
-  // Explicit field set by extraction
-  if (certData.isComplexPoC === "true" || certData.isComplexPoC === true) return true;
-  // Heuristic: PoC + 3+ airports + has monthly or airport volume breakdown
-  const isPoC = (certData.docType || "").toLowerCase().includes("poc") ||
-                (certData.docType || "").toLowerCase().includes("proof of compliance");
-  if (!isPoC) return false;
-  const airports = (certData.deliveryAirports || "").split(/[,\s]+/).filter(Boolean);
-  const hasMultipleAirports = airports.length >= 3;
-  return hasMultipleAirports; // volume breakdown may not be extracted, airport count is sufficient
+function buildDeterministicMatch(certData, invoiceRows) {
+  const criteria = buildCertCriteria(certData);
+  if (!Number.isFinite(criteria.targetVolume) || criteria.targetVolume <= 0) {
+    return {
+      status: "unmatched",
+      match_method: "unusable-volume",
+      cert_volume_m3: null,
+      allocated_volume_m3: 0,
+      variance_m3: null,
+      review_note: "Certificate quantity could not be parsed into m3.",
+      candidate_sets: [],
+      linked_rows: [],
+    };
+  }
+
+  const availableRows = invoiceRows.filter(
+    (row) => !row.is_allocated && Number.isFinite(Number(row.vol_m3)) && Number(row.vol_m3) > 0
+  );
+
+  const signals = new Map(availableRows.map((row) => [row.id, scoreInvoiceRow(row, criteria)]));
+
+  const pools = [];
+  const pushPool = (rows, label, priority) => {
+    if (!rows.length) return;
+    pools.push({ rows, label, priority });
+  };
+
+  const exactSingles = availableRows.filter(
+    (row) => Math.abs(Number(row.vol_m3) - criteria.targetVolume) <= MATCH_TOLERANCE
+  );
+  pushPool(exactSingles, "exact-single-row", 9);
+
+  if (criteria.contractRefs.length) {
+    pushPool(availableRows.filter((row) => signals.get(row.id)?.contractMatch), "contract-ref", 8);
+  }
+  if (criteria.airports.size && criteria.dateRange) {
+    pushPool(
+      availableRows.filter((row) => signals.get(row.id)?.airportMatch && signals.get(row.id)?.dateMatch),
+      "airport+date",
+      7
+    );
+  }
+  if (criteria.airports.size) {
+    pushPool(availableRows.filter((row) => signals.get(row.id)?.airportMatch), "airport", 6);
+  }
+  if (criteria.dateRange) {
+    pushPool(availableRows.filter((row) => signals.get(row.id)?.dateMatch), "date", 5);
+  }
+  if (criteria.recipientTokens.length) {
+    pushPool(availableRows.filter((row) => signals.get(row.id)?.customerMatch), "customer", 4);
+  }
+
+  pushPool(
+    [...availableRows].sort((a, b) => {
+      const scoreDiff = (signals.get(b.id)?.score || 0) - (signals.get(a.id)?.score || 0);
+      if (scoreDiff !== 0) return scoreDiff;
+      return Math.abs(criteria.targetVolume - Number(a.vol_m3)) - Math.abs(criteria.targetVolume - Number(b.vol_m3));
+    }),
+    "volume-only",
+    1
+  );
+
+  const candidateMap = new Map();
+  for (const pool of pools) {
+    const found = searchCandidateSets(pool.rows, criteria, signals, pool.label, pool.priority);
+    for (const candidate of found) {
+      const existing = candidateMap.get(candidate.key);
+      if (!existing || candidate.score > existing.score) candidateMap.set(candidate.key, candidate);
+    }
+  }
+
+  const candidates = [...candidateMap.values()].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (Math.abs(a.variance_m3) !== Math.abs(b.variance_m3)) {
+      return Math.abs(a.variance_m3) - Math.abs(b.variance_m3);
+    }
+    if (a.rows.length !== b.rows.length) return a.rows.length - b.rows.length;
+    return (a.rows[0]?.row_number || 0) - (b.rows[0]?.row_number || 0);
+  });
+
+  if (!candidates.length) {
+    return {
+      status: "unmatched",
+      match_method: "none",
+      cert_volume_m3: criteria.targetVolume,
+      allocated_volume_m3: 0,
+      variance_m3: criteria.targetVolume,
+      review_note: `No free invoice row group matches ${formatVolume(criteria.targetVolume)} m3 within ${MATCH_TOLERANCE} m3.`,
+      candidate_sets: [],
+      linked_rows: [],
+    };
+  }
+
+  if (candidates.length === 1) {
+    const winner = candidates[0];
+    return {
+      status: "auto_linked",
+      match_method: winner.match_method,
+      cert_volume_m3: criteria.targetVolume,
+      allocated_volume_m3: winner.total_volume_m3,
+      variance_m3: winner.variance_m3,
+      review_note: `Unique deterministic match found using ${winner.match_method}.`,
+      candidate_sets: [winner],
+      linked_rows: winner.rows,
+    };
+  }
+
+  const topCandidates = candidates.slice(0, MAX_SEARCH_RESULTS);
+  return {
+    status: "needs_review",
+    match_method: topCandidates[0].match_method,
+    cert_volume_m3: criteria.targetVolume,
+    allocated_volume_m3: topCandidates[0].total_volume_m3,
+    variance_m3: topCandidates[0].variance_m3,
+    review_note: `${candidates.length} valid invoice groups match ${formatVolume(criteria.targetVolume)} m3. Manual approval required.`,
+    candidate_sets: topCandidates,
+    linked_rows: [],
+  };
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+function certTitle(cert) {
+  return cert?.data?.uniqueNumber || cert?.filename || "Certificate";
+}
 
 function Badge({ status }) {
+  const label = String(status || "unknown");
   const map = {
-    Compliant: ["#00ff9d", "#001a0d"],
-    "Non-Compliant": ["#ff4444", "#1a0000"],
-    "Needs Review": ["#ffbb00", "#1a1200"],
-    Accept: ["#00ff9d", "#001a0d"],
-    Reject: ["#ff4444", "#1a0000"],
-    "Review Manually": ["#ffbb00", "#1a1200"],
-    High: ["#00ff9d", "#001a0d"],
-    Medium: ["#ffbb00", "#1a1200"],
-    Low: ["#ff9900", "#1a0800"],
-    None: ["#888", "#111"],
-    COMPLEX: ["#aa00ff", "#110022"],
-    Complete: ["#00ff9d", "#001a0d"],
-    Partial: ["#ffbb00", "#1a1200"],
+    auto_linked: ["#00ff9d", "#001a0d"],
+    approved: ["#00ff9d", "#001a0d"],
+    needs_review: ["#ffbb00", "#1a1200"],
+    unmatched: ["#ff6666", "#1a0000"],
+    rejected: ["#ff4444", "#1a0000"],
+    allocated: ["#00ff9d", "#001a0d"],
+    free: ["#4a9fd4", "#061423"],
   };
-  const [bg, fg] = map[status] || ["#555", "#fff"];
+  const key = label.toLowerCase().replace(/\s+/g, "_");
+  const [fg, bg] = map[key] || ["#c8dff0", "#0a1628"];
   return (
-    <span style={{
-      background: bg, color: fg, padding: "2px 10px", borderRadius: 4,
-      fontFamily: "'Space Mono', monospace", fontSize: 11, fontWeight: 700,
-      letterSpacing: 1, textTransform: "uppercase"
-    }}>{status}</span>
-  );
-}
-
-function CertCard({ cert, index, onSelect, selected, onAnalyze, onReExtract }) {
-  return (
-    <div onClick={() => onSelect(index)} style={{
-      background: selected ? "#0a1628" : "#060e1a",
-      border: selected ? "1px solid #00bfff" : "1px solid #0d2040",
-      borderRadius: 8, padding: "14px 18px", cursor: "pointer",
-      marginBottom: 8, transition: "all 0.15s",
-      boxShadow: selected ? "0 0 16px #00bfff33" : "none"
-    }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-        <div>
-          <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 11, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
-            {cert.data?.docType || "CERTIFICATE"}
-            {certIsComplex(cert.data) && <Badge status="COMPLEX" />}
-          </div>
-          <div style={{ color: "#e0f0ff", fontWeight: 600, fontSize: 13 }}>
-            {cert.data?.uniqueNumber || cert.filename}
-          </div>
-          <div style={{ color: "#4a7fa0", fontSize: 11, marginTop: 3 }}>
-            {cert.data?.issuer || cert.data?.supplier} → {cert.data?.recipient}
-          </div>
-        </div>
-        <div style={{ textAlign: "right", display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
-          {cert.analysis
-            ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
-                <Badge status={cert.analysis.complianceStatus} />
-                {cert.pdfPath && (
-                  <button className="btn" onClick={e => { e.stopPropagation(); onReExtract(index); }} style={{
-                    background: "#0a1628", color: "#4a9fd4", padding: "2px 8px", borderRadius: 4,
-                    fontFamily: "'Space Mono',monospace", fontSize: 9, letterSpacing: 1,
-                    border: "1px solid #0d3060"
-                  }}>↺ RE-EXTRACT</button>
-                )}
-              </div>
-            )
-            : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
-                <button className="btn" onClick={e => { e.stopPropagation(); onAnalyze(index); }} style={{
-                  background: "linear-gradient(135deg,#0050aa,#00bfff)", color: "#fff",
-                  padding: "3px 10px", borderRadius: 4,
-                  fontFamily: "'Space Mono',monospace", fontSize: 10, letterSpacing: 1
-                }}>
-                  🤖 ANALYZE
-                </button>
-                {cert.pdfPath && (
-                  <button className="btn" onClick={e => { e.stopPropagation(); onReExtract(index); }} style={{
-                    background: "#0a1628", color: "#4a9fd4", padding: "2px 8px", borderRadius: 4,
-                    fontFamily: "'Space Mono',monospace", fontSize: 9, letterSpacing: 1,
-                    border: "1px solid #0d3060"
-                  }}>↺ RE-EXTRACT</button>
-                )}
-              </div>
-            )
-          }
-          <div style={{ color: "#4a7fa0", fontSize: 10 }}>
-            {cert.data?.dateDispatch || cert.data?.supplyPeriod}
-          </div>
-        </div>
-      </div>
-    </div>
+    <span
+      style={{
+        background: bg,
+        color: fg,
+        padding: "2px 10px",
+        borderRadius: 4,
+        fontFamily: "'Space Mono', monospace",
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: 1,
+        textTransform: "uppercase",
+      }}
+    >
+      {label.replace(/_/g, " ")}
+    </span>
   );
 }
 
 function FieldRow({ label, value, highlight }) {
-  if (!value) return null;
+  if (value === undefined || value === null || value === "") return null;
   return (
-    <div style={{
-      display: "flex", gap: 12, padding: "5px 0",
-      borderBottom: "1px solid #0d2040"
-    }}>
-      <div style={{ color: "#4a7fa0", fontSize: 11, width: 180, flexShrink: 0, fontFamily: "'Space Mono',monospace" }}>
+    <div
+      style={{
+        display: "flex",
+        gap: 12,
+        padding: "5px 0",
+        borderBottom: "1px solid #0d2040",
+      }}
+    >
+      <div
+        style={{
+          color: "#4a7fa0",
+          fontSize: 11,
+          width: 180,
+          flexShrink: 0,
+          fontFamily: "'Space Mono', monospace",
+        }}
+      >
         {label}
       </div>
-      <div style={{ color: highlight ? "#00ff9d" : "#c8dff0", fontSize: 12, wordBreak: "break-word" }}>
-        {value}
-      </div>
+      <div style={{ color: highlight ? "#00ff9d" : "#c8dff0", fontSize: 12, wordBreak: "break-word" }}>{value}</div>
     </div>
   );
 }
 
-function GHGBar({ label, value, max = 10 }) {
-  const v = parseFloat(value) || 0;
-  const pct = Math.min((Math.abs(v) / max) * 100, 100);
+function MatchRowsTable({ rows, title = "LINKED INVOICE ROWS", emptyText = "No linked invoice rows yet." }) {
   return (
-    <div style={{ marginBottom: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#4a7fa0", marginBottom: 2 }}>
-        <span style={{ fontFamily: "'Space Mono',monospace" }}>{label}</span>
-        <span style={{ color: "#00bfff" }}>{value || "0"} gCO₂eq/MJ</span>
+    <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
+      <div
+        style={{
+          color: "#00bfff",
+          fontFamily: "'Space Mono', monospace",
+          fontSize: 10,
+          marginBottom: 10,
+          letterSpacing: 1,
+        }}
+      >
+        {title}
       </div>
-      <div style={{ background: "#0d2040", borderRadius: 2, height: 4 }}>
-        <div style={{
-          width: `${pct}%`, height: 4, borderRadius: 2,
-          background: v < 0 ? "#00ff9d" : "#00bfff", transition: "width 0.5s"
-        }} />
-      </div>
+      {!rows?.length ? (
+        <div style={{ color: "#4a7fa0", fontSize: 11 }}>{emptyText}</div>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #0d3060" }}>
+                {["CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "VOL M3"].map((header) => (
+                  <th key={header} style={{ padding: "6px 10px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
+                    {header}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, index) => (
+                <tr key={`${row.invoice_row_id || row.row_number}-${index}`} style={{ borderBottom: "1px solid #0d2040" }}>
+                  <td style={{ padding: "6px 10px", color: "#4a9fd4" }}>{row.row_number || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.customer || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#888" }}>{row.uplift_date || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.iata || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.icao || "—"}</td>
+                  <td style={{ padding: "6px 10px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.allocated_m3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
 
-// ─── Main Application ─────────────────────────────────────────────────────────
+function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onOpenPdf }) {
+  const status = cert.match?.status;
+  return (
+    <div
+      onClick={() => onSelect(index)}
+      style={{
+        background: selected ? "#0a1628" : "#060e1a",
+        border: selected ? "1px solid #00bfff" : "1px solid #0d2040",
+        borderRadius: 8,
+        padding: "14px 18px",
+        cursor: "pointer",
+        marginBottom: 8,
+        transition: "all 0.15s",
+        boxShadow: selected ? "0 0 16px #00bfff33" : "none",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div>
+          <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 11, marginBottom: 4 }}>
+            {cert.data?.docType || "CERTIFICATE"}
+          </div>
+          {cert.pdfPath ? (
+            <button
+              className="btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenPdf(cert);
+              }}
+              style={{
+                background: "none",
+                color: "#e0f0ff",
+                fontWeight: 600,
+                fontSize: 13,
+                padding: 0,
+                textAlign: "left",
+                textDecoration: "underline",
+                textUnderlineOffset: 3,
+              }}
+            >
+              {certTitle(cert)}
+            </button>
+          ) : (
+            <div style={{ color: "#e0f0ff", fontWeight: 600, fontSize: 13 }}>{certTitle(cert)}</div>
+          )}
+          <div style={{ color: "#4a7fa0", fontSize: 11, marginTop: 3 }}>
+            {formatVolume(cert.data?.quantity)} {cert.data?.quantityUnit || "m3"}
+          </div>
+          <div style={{ color: "#4a7fa0", fontSize: 10, marginTop: 3 }}>
+            {cert.match ? `${formatVolume(cert.match.allocated_volume_m3)} linked` : "Not matched yet"}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+          {status ? <Badge status={status} /> : null}
+          <button
+            className="btn"
+            onClick={(event) => {
+              event.stopPropagation();
+              onAnalyze(index);
+            }}
+            style={{
+              background: "linear-gradient(135deg,#0050aa,#00bfff)",
+              color: "#fff",
+              padding: "3px 10px",
+              borderRadius: 4,
+              fontFamily: "'Space Mono', monospace",
+              fontSize: 10,
+              letterSpacing: 1,
+            }}
+          >
+            MATCH
+          </button>
+          {cert.pdfPath ? (
+            <button
+              className="btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                onReExtract(index);
+              }}
+              style={{
+                background: "#0a1628",
+                color: "#4a9fd4",
+                padding: "2px 8px",
+                borderRadius: 4,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 9,
+                letterSpacing: 1,
+                border: "1px solid #0d3060",
+              }}
+            >
+              RE-EXTRACT
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default function SAFManager({ onLogout, userEmail }) {
   const [certs, setCerts] = useState([]);
   const [selected, setSelected] = useState(null);
-  const [invoices, setInvoices] = useState([]);
+  const [invoiceRows, setInvoiceRows] = useState([]);
+  const [invoiceImport, setInvoiceImport] = useState(null);
   const [loading, setLoading] = useState("");
-  const [tab, setTab] = useState("certs"); // certs | analysis | db
+  const [tab, setTab] = useState("certs");
   const [log, setLog] = useState([]);
-  const [expandedAttributionRow, setExpandedAttributionRow] = useState(null);
+  const [expandedCandidates, setExpandedCandidates] = useState({});
+  const [pdfPreview, setPdfPreview] = useState(null);
   const pdfInputRef = useRef();
   const csvInputRef = useRef();
 
-  const addLog = (msg, type = "info") => {
-    setLog((p) => [...p, { msg, type, ts: new Date().toLocaleTimeString() }]);
-  };
-
-  // Load persisted data from Supabase on mount
-  const loadFromDB = useCallback(async () => {
-    // Load certificates
-    const { data: certRows, error: certErr } = await supabase
-      .from("certificates").select("*").order("created_at", { ascending: false });
-    if (certErr) { addLog(`✗ Cert DB error: ${certErr.message}`, "error"); }
-    else {
-      const count = certRows?.length || 0;
-      setCerts((certRows || []).map(r => ({ id: r.id, filename: r.filename, data: r.data, analysis: r.analysis, pdfPath: r.pdf_path })));
-      addLog(`↺ DB: ${count} certificate(s) loaded`, count > 0 ? "success" : "info");
-    }
-
-    // Load latest invoice CSV from storage bucket
-    const { data: invRows, error: invErr } = await supabase
-      .from("invoices").select("id, filename, csv_path").not("csv_path", "is", null).order("created_at", { ascending: false }).limit(1);
-    if (invErr) { addLog(`✗ Invoice DB error: ${invErr.message}`, "error"); return; }
-    const latest = invRows?.[0];
-    if (!latest?.csv_path) return;
-    const { data: blob, error: dlErr } = await supabase.storage
-      .from("invoices-csv").download(latest.csv_path);
-    if (dlErr) { addLog(`✗ Invoice CSV download: ${dlErr.message}`, "error"); return; }
-    const text = await blob.text();
-    const rows = csvToRows(text);
-    setInvoices(rows);
-    addLog(`✓ Loaded ${rows.length} invoice records from ${latest.filename}`, "success");
+  const addLog = useCallback((msg, type = "info") => {
+    setLog((prev) => [...prev, { msg, type, ts: new Date().toLocaleTimeString() }]);
   }, []);
 
-  useEffect(() => { loadFromDB(); }, []);
-
-  const handlePDFUpload = useCallback(async (files) => {
-    setLoading("Extracting certificate data...");
-    const arr = Array.from(files);
-    const newCerts = [];
-
-    for (const file of arr) {
-      if (!file.type.includes("pdf")) continue;
-      addLog(`Processing: ${file.name}`, "info");
-      try {
-        const b64 = await fileToBase64(file);
-
-        // Call Claude with the PDF as a document
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: ANTHROPIC_HEADERS,
-          body: JSON.stringify({
-            model: ANTHROPIC_MODEL,
-            max_tokens: 4096,
-            messages: [{
-              role: "user",
-              content: [
-                {
-                  type: "document",
-                  source: { type: "base64", media_type: "application/pdf", data: b64 }
-                },
-                { type: "text", text: EXTRACT_PROMPT }
-              ]
-            }]
-          })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(`API error ${res.status}: ${data.error?.message || JSON.stringify(data)}`);
-        }
-        const text = data.content?.map(b => b.text || "").join("") || "{}";
-
-        let parsed = {};
-        try {
-          const clean = text.replace(/```json|```/g, "").trim();
-          parsed = normalizeCommaDecimals(JSON.parse(clean));
-        } catch (e) {
-          addLog(`⚠ Parse error for ${file.name}: ${e.message} — raw: ${text.slice(0, 100)}`, "error");
-        }
-
-        const uniqueNumber = parsed.uniqueNumber || null;
-
-        // Upload original PDF to storage bucket for future re-extraction
-        const storagePath = uniqueNumber
-          ? `${uniqueNumber}.pdf`
-          : `no-id/${Date.now()}-${file.name}`;
-        const { error: storageErr } = await supabase.storage
-          .from("certificates-pdf")
-          .upload(storagePath, file, { contentType: "application/pdf", upsert: true });
-        if (storageErr) addLog(`⚠ PDF storage failed: ${storageErr.message} — re-extraction will not be available for this cert`, "error");
-
-        const pdfPath = storageErr ? null : storagePath;
-        let saved, dbErr;
-
-        if (uniqueNumber) {
-          // Try insert first; on unique violation (23505) update the existing row instead
-          ({ data: saved, error: dbErr } = await supabase
-            .from("certificates")
-            .insert({ filename: file.name, data: parsed, unique_number: uniqueNumber, pdf_path: pdfPath })
-            .select("id, analysis, pdf_path").single());
-          if (dbErr?.code === "23505") {
-            ({ data: saved, error: dbErr } = await supabase
-              .from("certificates")
-              .update({ filename: file.name, data: parsed, pdf_path: pdfPath })
-              .eq("unique_number", uniqueNumber)
-              .select("id, analysis, pdf_path").single());
-          }
-        } else {
-          ({ data: saved, error: dbErr } = await supabase
-            .from("certificates")
-            .insert({ filename: file.name, data: parsed, pdf_path: pdfPath })
-            .select("id, analysis, pdf_path").single());
-        }
-
-        if (dbErr) addLog(`⚠ DB save error for ${file.name}: ${dbErr.message}`, "error");
-        else addLog(`✓ Saved: ${parsed.uniqueNumber || file.name}${pdfPath ? " + PDF stored" : ""}`, "success");
-        newCerts.push({ id: saved?.id, filename: file.name, data: parsed, analysis: saved?.analysis ?? null, pdfPath: saved?.pdf_path ?? pdfPath });
-      } catch (e) {
-        addLog(`✗ Error: ${file.name} — ${e.message}`, "error");
+  const deleteByIds = useCallback(
+    async (table, ids) => {
+      if (!ids.length) return;
+      for (let index = 0; index < ids.length; index += 200) {
+        const chunk = ids.slice(index, index + 200);
+        const { error } = await supabase.from(table).delete().in("id", chunk);
+        if (error) throw error;
       }
+    },
+    []
+  );
+
+  const loadFromDB = useCallback(async () => {
+    const { data: certRows, error: certErr } = await supabase
+      .from("certificates")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (certErr) {
+      addLog(`Cert DB error: ${certErr.message}`, "error");
+      return;
     }
 
-    setCerts(p => {
-      const map = new Map(p.map(c => [c.id, c]));
-      for (const c of newCerts) if (c.id) map.set(c.id, c);
-      return [...map.values()];
-    });
-    setLoading("");
-    if (newCerts.length) setTab("certs");
+    const [importRes, matchRes, linkRes] = await Promise.all([
+      supabase.from("invoice_imports").select("*").order("created_at", { ascending: false }).limit(1),
+      supabase.from("certificate_matches").select("*"),
+      supabase.from("certificate_invoice_links").select("*"),
+    ]);
+
+    if (importRes.error && !isMissingTableError(importRes.error)) addLog(`Invoice import error: ${importRes.error.message}`, "error");
+    if (matchRes.error && !isMissingTableError(matchRes.error)) addLog(`Match DB error: ${matchRes.error.message}`, "error");
+    if (linkRes.error && !isMissingTableError(linkRes.error)) addLog(`Link DB error: ${linkRes.error.message}`, "error");
+
+    const latestImport = importRes.data?.[0] || null;
+    setInvoiceImport(latestImport);
+
+    let invoiceRowsData = [];
+    if (latestImport) {
+      const { data, error } = await fetchAllPages((from, to) =>
+        supabase
+          .from("invoice_rows")
+          .select("*")
+          .eq("import_id", latestImport.id)
+          .order("row_number", { ascending: true })
+          .range(from, to)
+      );
+      if (error) addLog(`Invoice rows error: ${error.message}`, "error");
+      else invoiceRowsData = data || [];
+    }
+    setInvoiceRows(invoiceRowsData);
+
+    const linksByCertId = new Map();
+    for (const link of linkRes.data || []) {
+      const arr = linksByCertId.get(link.certificate_id) || [];
+      arr.push(link);
+      linksByCertId.set(link.certificate_id, arr);
+    }
+
+    const matchByCertId = new Map(
+      (matchRes.data || []).map((match) => [
+        match.certificate_id,
+        {
+          ...match,
+          links: (linksByCertId.get(match.certificate_id) || []).sort((a, b) => (a.row_number || 0) - (b.row_number || 0)),
+          candidate_sets: match.candidate_sets || [],
+        },
+      ])
+    );
+
+    const hydrated = (certRows || []).map((row) => ({
+      id: row.id,
+      filename: row.filename,
+      data: row.data,
+      analysis: row.analysis,
+      pdfPath: row.pdf_path,
+      match: matchByCertId.get(row.id) || null,
+    }));
+    setCerts(hydrated);
+    addLog(`Loaded ${hydrated.length} certificate(s) and ${invoiceRowsData.length} invoice row(s)`, "success");
+  }, [addLog]);
+
+  useEffect(() => {
+    loadFromDB();
+  }, [loadFromDB]);
+
+  useEffect(() => {
+    return () => {
+      if (pdfPreview?.url) URL.revokeObjectURL(pdfPreview.url);
+    };
+  }, [pdfPreview]);
+
+  useEffect(() => {
+    if (selected !== null && selected >= certs.length) setSelected(certs.length ? 0 : null);
+    if (selected === null && certs.length) setSelected(0);
+  }, [certs, selected]);
+
+  const clearCertificateMatch = useCallback(async (certificateId) => {
+    const { data: links, error: linksErr } = await supabase
+      .from("certificate_invoice_links")
+      .select("invoice_row_id")
+      .eq("certificate_id", certificateId);
+    if (linksErr && !isMissingTableError(linksErr)) throw linksErr;
+
+    const linkedIds = (links || []).map((item) => item.invoice_row_id).filter(Boolean);
+    if (linkedIds.length) {
+      const { error: unlockErr } = await supabase.from("invoice_rows").update({ is_allocated: false }).in("id", linkedIds);
+      if (unlockErr) throw unlockErr;
+    }
+
+    const { error: deleteErr } = await supabase.from("certificate_matches").delete().eq("certificate_id", certificateId);
+    if (deleteErr && !isMissingTableError(deleteErr)) throw deleteErr;
   }, []);
 
-  const handleCSVUpload = useCallback(async (file) => {
-    try {
-      // Upload CSV to storage bucket (upsert so re-uploading a new file replaces it)
-      const storagePath = `invoices/${file.name}`;
-      const { error: storageErr } = await supabase.storage
-        .from("invoices-csv")
-        .upload(storagePath, file, { contentType: "text/csv", upsert: true });
-      if (storageErr) {
-        addLog(`⚠ Storage upload: ${storageErr.message}`, "error");
+  const persistMatch = useCallback(
+    async (certificate, result, reviewer) => {
+      await clearCertificateMatch(certificate.id);
+
+      const { data: insertedMatch, error: matchErr } = await supabase
+        .from("certificate_matches")
+        .insert({
+          certificate_id: certificate.id,
+          status: result.status,
+          match_method: result.match_method,
+          cert_volume_m3: result.cert_volume_m3,
+          allocated_volume_m3: result.allocated_volume_m3,
+          variance_m3: result.variance_m3,
+          review_note: result.review_note,
+          reviewed_by: reviewer || null,
+          reviewed_at: reviewer && (result.status === "approved" || result.status === "rejected") ? new Date().toISOString() : null,
+          candidate_sets: result.candidate_sets || [],
+          updated_at: new Date().toISOString(),
+        })
+        .select("*")
+        .single();
+
+      if (matchErr) throw matchErr;
+
+      const linkedRows = result.linked_rows || [];
+      if (linkedRows.length) {
+        const { error: linksErr } = await supabase.from("certificate_invoice_links").insert(
+          linkedRows.map((row) => ({
+            certificate_match_id: insertedMatch.id,
+            certificate_id: certificate.id,
+            invoice_row_id: row.invoice_row_id,
+            row_number: row.row_number,
+            invoice_no: row.invoice_no,
+            customer: row.customer,
+            uplift_date: row.uplift_date,
+            iata: row.iata,
+            icao: row.icao,
+            allocated_m3: row.allocated_m3,
+          }))
+        );
+        if (linksErr) throw linksErr;
+
+        const { error: allocErr } = await supabase
+          .from("invoice_rows")
+          .update({ is_allocated: true })
+          .in(
+            "id",
+            linkedRows.map((row) => row.invoice_row_id)
+          );
+        if (allocErr) throw allocErr;
+      }
+    },
+    [clearCertificateMatch]
+  );
+
+  const handlePDFUpload = useCallback(
+    async (files) => {
+      const list = Array.from(files || []);
+      if (!list.length) return;
+      setLoading("Extracting certificate data...");
+
+      for (const file of list) {
+        if (!file.type.includes("pdf")) continue;
+        addLog(`Processing ${file.name}`, "info");
+        try {
+          const base64 = await fileToBase64(file);
+          const parsed = await extractCertificateFromBase64(base64);
+          const uniqueNumber = parsed.uniqueNumber || null;
+          const storagePath = uniqueNumber ? `${uniqueNumber}.pdf` : `no-id/${Date.now()}-${file.name}`;
+
+          const { error: storageErr } = await supabase.storage
+            .from("certificates-pdf")
+            .upload(storagePath, file, { contentType: "application/pdf", upsert: true });
+          if (storageErr) addLog(`PDF storage warning for ${file.name}: ${storageErr.message}`, "error");
+
+          let saveRes;
+          if (uniqueNumber) {
+            saveRes = await supabase
+              .from("certificates")
+              .insert({ filename: file.name, data: parsed, unique_number: uniqueNumber, pdf_path: storageErr ? null : storagePath })
+              .select("id")
+              .single();
+            if (saveRes.error?.code === "23505") {
+              saveRes = await supabase
+                .from("certificates")
+                .update({ filename: file.name, data: parsed, pdf_path: storageErr ? null : storagePath })
+                .eq("unique_number", uniqueNumber)
+                .select("id")
+                .single();
+            }
+          } else {
+            saveRes = await supabase
+              .from("certificates")
+              .insert({ filename: file.name, data: parsed, pdf_path: storageErr ? null : storagePath })
+              .select("id")
+              .single();
+          }
+          if (saveRes.error) throw saveRes.error;
+          addLog(`Saved ${certTitle({ filename: file.name, data: parsed })}`, "success");
+        } catch (error) {
+          addLog(`Certificate import failed for ${file.name}: ${error.message}`, "error");
+        }
+      }
+
+      setLoading("");
+      await loadFromDB();
+      setTab("certs");
+    },
+    [addLog, loadFromDB]
+  );
+
+  const handleCSVUpload = useCallback(
+    async (file) => {
+      if (!file) return;
+      setLoading("Importing annual invoice CSV...");
+      addLog(`Importing invoice CSV ${file.name}`, "info");
+
+      try {
+        const text = await file.text();
+        const parsed = parseInvoiceCSV(text);
+        if (!parsed.rows.length) throw new Error("CSV is empty.");
+        if (parsed.missing.includes("vol_m3")) throw new Error("Missing required column: Vol in M3.");
+
+        const storagePath = `invoices/${file.name}`;
+        const { error: storageErr } = await supabase.storage
+          .from("invoices-csv")
+          .upload(storagePath, file, { contentType: "text/csv", upsert: true });
+        if (storageErr) throw storageErr;
+
+        const [existingImportsRes, existingMatchesRes] = await Promise.all([
+          supabase.from("invoice_imports").select("id"),
+          supabase.from("certificate_matches").select("id"),
+        ]);
+        if (existingMatchesRes.error && !isMissingTableError(existingMatchesRes.error)) throw existingMatchesRes.error;
+        if (existingImportsRes.error && !isMissingTableError(existingImportsRes.error)) throw existingImportsRes.error;
+
+        await deleteByIds("certificate_matches", (existingMatchesRes.data || []).map((row) => row.id));
+        await deleteByIds("invoice_imports", (existingImportsRes.data || []).map((row) => row.id));
+
+        const { data: importRow, error: importErr } = await supabase
+          .from("invoice_imports")
+          .insert({
+            filename: file.name,
+            storage_path: storagePath,
+            year: 2025,
+            status: "active",
+            row_count: parsed.rows.length,
+          })
+          .select("*")
+          .single();
+        if (importErr) throw importErr;
+
+        const cleanRows = parsed.rows.filter((row) => row.invoice_no || row.customer || Number.isFinite(row.vol_m3));
+        for (let index = 0; index < cleanRows.length; index += 500) {
+          const chunk = cleanRows.slice(index, index + 500).map((row) => ({
+            ...row,
+            import_id: importRow.id,
+          }));
+          const { error: rowsErr } = await supabase.from("invoice_rows").insert(chunk);
+          if (rowsErr) throw rowsErr;
+        }
+
+        addLog(
+          `Imported ${cleanRows.length} invoice rows${parsed.missing.length ? `; missing optional columns: ${parsed.missing.join(", ")}` : ""}`,
+          "success"
+        );
+        setLoading("");
+        await loadFromDB();
+        setTab("db");
+      } catch (error) {
+        setLoading("");
+        addLog(`Invoice import failed: ${error.message}`, "error");
+      }
+    },
+    [addLog, deleteByIds, loadFromDB]
+  );
+
+  const openCertificatePdf = useCallback(
+    async (cert) => {
+      if (!cert?.pdfPath) {
+        addLog(`No stored PDF found for ${certTitle(cert)}`, "error");
         return;
       }
 
-      // Save metadata to invoices table
-      const { error: dbErr } = await supabase
-        .from("invoices")
-        .insert({ filename: file.name, csv_path: storagePath });
-      if (dbErr) addLog(`⚠ DB save warning: ${dbErr.message}`, "error");
+      setLoading(`Opening ${certTitle(cert)}...`);
+      try {
+        const { data, error } = await supabase.storage.from("certificates-pdf").download(cert.pdfPath);
+        if (error) throw error;
+        const blobUrl = URL.createObjectURL(data);
+        setPdfPreview((prev) => {
+          if (prev?.url) URL.revokeObjectURL(prev.url);
+          return { title: certTitle(cert), url: blobUrl };
+        });
+        addLog(`Opened PDF preview for ${certTitle(cert)}`, "success");
+      } catch (error) {
+        addLog(`Open PDF failed for ${certTitle(cert)}: ${error.message}`, "error");
+      }
+      setLoading("");
+    },
+    [addLog]
+  );
 
-      // Parse and load into memory
-      const text = await file.text();
-      const rows = csvToRows(text);
-      setInvoices(rows);
-      addLog(`✓ Loaded ${rows.length} invoice records from ${file.name}`, "success");
-    } catch (e) {
-      addLog(`✗ CSV error: ${e.message}`, "error");
-    }
-  }, []);
+  const reExtractCert = useCallback(
+    async (index) => {
+      const cert = certs[index];
+      if (!cert?.pdfPath) {
+        addLog("No stored PDF for this certificate", "error");
+        return;
+      }
+      setLoading(`Re-extracting ${certTitle(cert)}...`);
+      addLog(`Re-extracting ${cert.pdfPath}`, "info");
 
-  const analyzeComplexPoC = useCallback(async (index) => {
-    const cert = certs[index];
-    if (!cert) return;
-    const label = cert.data?.uniqueNumber || cert.filename;
-    addLog(`Complex PoC analysis: ${label}`, "info");
+      try {
+        const { data: blob, error: dlErr } = await supabase.storage.from("certificates-pdf").download(cert.pdfPath);
+        if (dlErr) throw dlErr;
+        const base64 = await blobToBase64(blob);
+        const parsed = await extractCertificateFromBase64(base64);
 
-    // Step 1: Compliance check
-    setLoading("[1/2] Compliance check...");
-    let complianceAnalysis = { complianceStatus: "Needs Review", complianceNotes: "Compliance check failed" };
-    try {
-      const filteredForCompliance = filterInvoicesForCert(cert.data, invoices);
-      const prompt = COMPARE_PROMPT(cert.data, filteredForCompliance);
-      const res = await callClaude([{ role: "user", content: prompt }],
-        "You are a SAF compliance expert. Return only valid JSON.", 4096);
-      const clean = res.replace(/```json|```/g, "").trim();
-      complianceAnalysis = JSON.parse(clean);
-      addLog(`✓ Compliance: ${complianceAnalysis.complianceStatus}`, "success");
-    } catch (e) {
-      addLog(`⚠ Compliance step error: ${e.message}`, "error");
-    }
+        const { error: updateErr } = await supabase.from("certificates").update({ data: parsed }).eq("id", cert.id);
+        if (updateErr) throw updateErr;
 
-    // Step 2: Client attribution
-    setLoading("[2/2] Attribution...");
-    let attributionResult = null;
-    try {
-      const filteredForAttribution = filterInvoicesForCert(cert.data, invoices);
-      const prompt = ATTRIBUTION_PROMPT(cert.data, filteredForAttribution);
-      const res = await callClaude([{ role: "user", content: prompt }],
-        "You are a SAF compliance analyst. Return only valid JSON.", 4096);
-      const clean = res.replace(/```json|```/g, "").trim();
-      attributionResult = JSON.parse(clean);
-      addLog(`✓ Attribution: ${attributionResult.attributionStatus}`, "success");
-    } catch (e) {
-      addLog(`⚠ Attribution step error: ${e.message}`, "error");
-    }
+        addLog(`Re-extracted ${certTitle({ ...cert, data: parsed })}`, "success");
+        setLoading("");
+        await loadFromDB();
+      } catch (error) {
+        setLoading("");
+        addLog(`Re-extract failed: ${error.message}`, "error");
+      }
+    },
+    [addLog, certs, loadFromDB]
+  );
 
-    const analysis = { ...complianceAnalysis, isComplexPoC: true, attribution: attributionResult };
-    if (cert.id) {
-      const { error: updateErr } = await supabase.from("certificates").update({ analysis }).eq("id", cert.id);
-      if (updateErr) addLog(`⚠ Failed to persist analysis: ${updateErr.message}`, "error");
-    }
-    setCerts(p => { const a = [...p]; a[index] = { ...cert, analysis }; return a; });
-    setLoading("");
-    setTab("analysis");
-  }, [certs, invoices]);
+  const analyzeSingle = useCallback(
+    async (index) => {
+      const cert = certs[index];
+      if (!cert?.id) return;
+      if (!invoiceRows.length) {
+        addLog("Load the annual invoice CSV before matching certificates.", "error");
+        return;
+      }
+
+      setLoading(`Matching ${certTitle(cert)}...`);
+      addLog(`Matching ${certTitle(cert)}`, "info");
+
+      try {
+        const workingRows = invoiceRows.map((row) => ({ ...row }));
+        for (const link of cert.match?.links || []) {
+          const target = workingRows.find((row) => row.id === link.invoice_row_id);
+          if (target) target.is_allocated = false;
+        }
+        const result = buildDeterministicMatch(cert.data, workingRows);
+        await persistMatch(cert, result, null);
+        addLog(`${certTitle(cert)} → ${result.status}`, result.status === "unmatched" ? "error" : "success");
+        setLoading("");
+        await loadFromDB();
+        setTab("analysis");
+      } catch (error) {
+        setLoading("");
+        addLog(`Matching failed for ${certTitle(cert)}: ${error.message}`, "error");
+      }
+    },
+    [addLog, certs, invoiceRows, loadFromDB, persistMatch]
+  );
 
   const analyzeAll = useCallback(async () => {
     if (!certs.length) return;
-    setLoading("Analyzing with AI...");
-    const updated = [...certs];
-
-    for (let i = 0; i < updated.length; i++) {
-      const cert = updated[i];
-      addLog(`Analyzing: ${cert.data?.uniqueNumber || cert.filename}`, "info");
-
-      if (certIsComplex(cert.data)) {
-        await analyzeComplexPoC(i);
-        updated[i] = certs[i]; // will be updated by analyzeComplexPoC via setCerts
-        continue;
-      }
-
-      try {
-        const filteredInvoices = filterInvoicesForCert(cert.data, invoices);
-        const prompt = COMPARE_PROMPT(cert.data, filteredInvoices.length ? filteredInvoices : invoices.slice(0, 300));
-        const res = await callClaude([{ role: "user", content: prompt }],
-          "You are a SAF compliance expert. Return only valid JSON.");
-        const clean = res.replace(/```json|```/g, "").trim();
-        const analysis = JSON.parse(clean);
-        updated[i] = { ...cert, analysis };
-        if (cert.id) {
-          const { error: updateErr } = await supabase.from("certificates").update({ analysis }).eq("id", cert.id);
-          if (updateErr) addLog(`⚠ Failed to persist analysis: ${updateErr.message}`, "error");
-        }
-        addLog(`✓ Analysis complete: ${analysis.complianceStatus}`, "success");
-      } catch (e) {
-        addLog(`✗ Analysis error: ${e.message}`, "error");
-        const fallback = { complianceStatus: "Needs Review", complianceNotes: "Error during analysis" };
-        updated[i] = { ...cert, analysis: fallback };
-        if (cert.id) {
-          const { error: updateErr } = await supabase.from("certificates").update({ analysis: fallback }).eq("id", cert.id);
-          if (updateErr) addLog(`⚠ Failed to persist analysis: ${updateErr.message}`, "error");
-        }
-      }
+    if (!invoiceRows.length) {
+      addLog("Load the annual invoice CSV before matching certificates.", "error");
+      return;
     }
 
-    setCerts(updated);
-    setLoading("");
-    setTab("analysis");
-  }, [certs, invoices, analyzeComplexPoC]);
+    setLoading("Resetting allocations...");
+    addLog("Resetting all matches before full run", "info");
 
-  const analyzeSingle = useCallback(async (index) => {
-    const cert = certs[index];
-    if (!cert) return;
-
-    if (certIsComplex(cert.data)) return analyzeComplexPoC(index);
-
-    setLoading(`Analyzing ${cert.data?.uniqueNumber || cert.filename}...`);
-    addLog(`Analyzing: ${cert.data?.uniqueNumber || cert.filename}`, "info");
     try {
-      const filteredInvoices = filterInvoicesForCert(cert.data, invoices);
-      const prompt = COMPARE_PROMPT(cert.data, filteredInvoices.length ? filteredInvoices : invoices.slice(0, 300));
-      const res = await callClaude([{ role: "user", content: prompt }],
-        "You are a SAF compliance expert. Return only valid JSON.");
-      const clean = res.replace(/```json|```/g, "").trim();
-      const analysis = JSON.parse(clean);
-      const updated = { ...cert, analysis };
-      if (cert.id) {
-        const { error: updateErr } = await supabase.from("certificates").update({ analysis }).eq("id", cert.id);
-        if (updateErr) addLog(`⚠ Failed to persist analysis: ${updateErr.message}`, "error");
+      const existingMatchesRes = await supabase.from("certificate_matches").select("id");
+      if (existingMatchesRes.error && !isMissingTableError(existingMatchesRes.error)) throw existingMatchesRes.error;
+      await deleteByIds("certificate_matches", (existingMatchesRes.data || []).map((row) => row.id));
+      const { error: resetRowsErr } = await supabase.from("invoice_rows").update({ is_allocated: false }).neq("id", "00000000-0000-0000-0000-000000000000");
+      if (resetRowsErr) throw resetRowsErr;
+
+      const workingRows = invoiceRows.map((row) => ({ ...row, is_allocated: false }));
+      for (let index = 0; index < certs.length; index += 1) {
+        const cert = certs[index];
+        setLoading(`Matching ${index + 1}/${certs.length}: ${certTitle(cert)}`);
+        const result = buildDeterministicMatch(cert.data, workingRows);
+        await persistMatch(cert, result, null);
+        if (result.linked_rows?.length) {
+          for (const linked of result.linked_rows) {
+            const row = workingRows.find((item) => item.id === linked.invoice_row_id);
+            if (row) row.is_allocated = true;
+          }
+        }
+        addLog(`${certTitle(cert)} → ${result.status}`, result.status === "needs_review" ? "info" : "success");
       }
-      setCerts(p => { const a = [...p]; a[index] = updated; return a; });
-      addLog(`✓ Analysis complete: ${analysis.complianceStatus}`, "success");
+
+      setLoading("");
+      await loadFromDB();
       setTab("analysis");
-    } catch (e) {
-      addLog(`✗ Analysis error: ${e.message}`, "error");
+    } catch (error) {
+      setLoading("");
+      addLog(`Full matching run failed: ${error.message}`, "error");
     }
-    setLoading("");
-  }, [certs, invoices, analyzeComplexPoC]);
+  }, [addLog, certs, deleteByIds, invoiceRows, loadFromDB, persistMatch]);
 
-  const reExtractCert = useCallback(async (index) => {
-    const cert = certs[index];
-    if (!cert?.pdfPath) { addLog("✗ No stored PDF for this certificate", "error"); return; }
-    setLoading(`Re-extracting ${cert.data?.uniqueNumber || cert.filename}...`);
-    addLog(`Re-extracting from bucket: ${cert.pdfPath}`, "info");
-    try {
-      const { data: blob, error: dlErr } = await supabase.storage
-        .from("certificates-pdf").download(cert.pdfPath);
-      if (dlErr) throw new Error(`Storage download: ${dlErr.message}`);
-      const b64 = await blobToBase64(blob);
-      // Retry with exponential backoff on 429
-      let attempt = 0;
-      let res;
-      while (attempt < 4) {
-        res = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: ANTHROPIC_HEADERS,
-          body: JSON.stringify({
-            model: ANTHROPIC_MODEL, max_tokens: 4096,
-            messages: [{ role: "user", content: [
-              { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-              { type: "text", text: EXTRACT_PROMPT }
-            ]}]
-          })
-        });
-        if (res.status !== 429) break;
-        const delay = Math.pow(2, attempt) * 5000;
-        addLog(`⏳ Rate limited, retrying in ${delay / 1000}s…`, "info");
-        await new Promise(r => setTimeout(r, delay));
-        attempt++;
-      }
-      const data = await res.json();
-      if (!res.ok) throw new Error(`API error ${res.status}: ${data.error?.message}`);
-      const text = data.content?.map(b => b.text || "").join("") || "{}";
-      const parsed = normalizeCommaDecimals(JSON.parse(text.replace(/```json|```/g, "").trim()));
-      if (cert.id) {
-        const { error: updateErr } = await supabase.from("certificates").update({ data: parsed }).eq("id", cert.id);
-        if (updateErr) addLog(`⚠ Failed to persist re-extracted data: ${updateErr.message}`, "error");
-      }
-      setCerts(p => { const a = [...p]; a[index] = { ...cert, data: parsed }; return a; });
-      addLog(`✓ Re-extracted: ${parsed.uniqueNumber || cert.filename}`, "success");
-    } catch (e) {
-      addLog(`✗ Re-extract error: ${e.message}`, "error");
-    }
-    setLoading("");
-  }, [certs]);
+  const approveCandidate = useCallback(
+    async (cert, candidateIndex) => {
+      const candidate = cert.match?.candidate_sets?.[candidateIndex];
+      if (!candidate) return;
 
-  const syncBucket = useCallback(async () => {
-    setLoading("Listing bucket files...");
-    addLog("↺ Syncing bucket → DB…", "info");
-
-    // List all files in the bucket (paginate in chunks of 1000)
-    const allFiles = [];
-    const PAGE = 1000;
-    // Recursively list a folder and collect PDF entries
-    const listFolder = async (prefix) => {
-      let offset = 0;
-      while (true) {
-        const { data: page, error } = await supabase.storage
-          .from("certificates-pdf").list(prefix || null, { limit: PAGE, offset, sortBy: { column: "name", order: "asc" } });
-        if (error) { addLog(`✗ Bucket list error (${prefix || "root"}): ${error.message}`, "error"); return false; }
-        if (!page?.length) break;
-        for (const f of page) {
-          const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
-          if (f.id === null) {
-            // It's a virtual folder — recurse into it
-            const ok = await listFolder(fullPath);
-            if (!ok) return false;
-          } else if (f.name.toLowerCase().endsWith(".pdf")) {
-            allFiles.push({ ...f, name: fullPath });
-          }
-        }
-        if (page.length < PAGE) break;
-        offset += PAGE;
-      }
-      return true;
-    };
-    const ok = await listFolder(null);
-    if (!ok) { setLoading(""); return; }
-    addLog(`↳ ${allFiles.length} PDF file(s) found in bucket`, "info");
-
-    // Load all known pdf_paths from DB
-    const { data: dbRows } = await supabase.from("certificates").select("pdf_path");
-    const knownPaths = new Set((dbRows || []).map(r => r.pdf_path).filter(Boolean));
-
-    const orphans = allFiles.filter(f => !knownPaths.has(f.name));
-    addLog(`Found ${allFiles.length} bucket file(s), ${orphans.length} not yet in DB`, "info");
-
-    if (!orphans.length) { addLog("✓ All bucket files already in DB", "success"); setLoading(""); return; }
-
-    let done = 0;
-    for (const file of orphans) {
-      const pdfPath = file.name;
-      setLoading(`Syncing ${done + 1}/${orphans.length}: ${pdfPath}`);
+      setLoading(`Approving match for ${certTitle(cert)}...`);
       try {
-        const { data: blob, error: dlErr } = await supabase.storage.from("certificates-pdf").download(pdfPath);
-        if (dlErr) throw new Error(`Download: ${dlErr.message}`);
-        const b64 = await blobToBase64(blob);
-
-        // Call Claude with retry on 429
-        let attempt = 0, res;
-        while (attempt < 5) {
-          res = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: ANTHROPIC_HEADERS,
-            body: JSON.stringify({
-              model: ANTHROPIC_MODEL, max_tokens: 4096,
-              messages: [{ role: "user", content: [
-                { type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } },
-                { type: "text", text: EXTRACT_PROMPT }
-              ]}]
-            })
-          });
-          if (res.status !== 429) break;
-          const delay = Math.pow(2, attempt) * 5000;
-          addLog(`⏳ Rate limited, retrying in ${delay / 1000}s…`, "info");
-          await new Promise(r => setTimeout(r, delay));
-          attempt++;
-        }
-
-        const data = await res.json();
-        if (!res.ok) throw new Error(`API error ${res.status}: ${data.error?.message}`);
-        const text = data.content?.map(b => b.text || "").join("") || "{}";
-        let parsed = {};
-        try { parsed = normalizeCommaDecimals(JSON.parse(text.replace(/```json|```/g, "").trim())); }
-        catch (e) { addLog(`⚠ Parse error for ${pdfPath}: ${e.message}`, "error"); }
-
-        const uniqueNumber = parsed.uniqueNumber || null;
-        const filename = pdfPath.split("/").pop();
-
-        let saved, dbErr;
-        if (uniqueNumber) {
-          ({ data: saved, error: dbErr } = await supabase.from("certificates")
-            .insert({ filename, data: parsed, unique_number: uniqueNumber, pdf_path: pdfPath })
-            .select("id").single());
-          if (dbErr?.code === "23505") {
-            // Already exists by unique_number — just update pdf_path + data
-            ({ data: saved, error: dbErr } = await supabase.from("certificates")
-              .update({ data: parsed, pdf_path: pdfPath })
-              .eq("unique_number", uniqueNumber)
-              .select("id").single());
-          }
-        } else {
-          ({ data: saved, error: dbErr } = await supabase.from("certificates")
-            .insert({ filename, data: parsed, pdf_path: pdfPath })
-            .select("id").single());
-        }
-
-        if (dbErr) addLog(`⚠ DB error for ${pdfPath}: ${dbErr.message}`, "error");
-        else addLog(`✓ [${done + 1}/${orphans.length}] ${parsed.uniqueNumber || filename}`, "success");
-      } catch (e) {
-        addLog(`✗ [${done + 1}/${orphans.length}] ${pdfPath}: ${e.message}`, "error");
+        await persistMatch(
+          cert,
+          {
+            status: "approved",
+            match_method: candidate.match_method,
+            cert_volume_m3: cert.match.cert_volume_m3,
+            allocated_volume_m3: candidate.total_volume_m3,
+            variance_m3: candidate.variance_m3,
+            review_note: `Approved candidate ${candidateIndex + 1}.`,
+            candidate_sets: cert.match.candidate_sets,
+            linked_rows: candidate.rows,
+          },
+          userEmail
+        );
+        addLog(`Approved match for ${certTitle(cert)}`, "success");
+        setLoading("");
+        await loadFromDB();
+      } catch (error) {
+        setLoading("");
+        addLog(`Approval failed: ${error.message}`, "error");
       }
-      done++;
-      // Pause between calls to stay under 30k tokens/min rate limit
-      if (done < orphans.length) await new Promise(r => setTimeout(r, 4000));
-    }
+    },
+    [addLog, loadFromDB, persistMatch, userEmail]
+  );
 
-    addLog(`✓ Sync complete — ${done} file(s) processed`, "success");
-    setLoading("Reloading DB…");
-    await loadFromDB();
-    setLoading("");
-  }, [loadFromDB]);
-
-  const exportXLSX = useCallback(async () => {
-    // Build CSV-like export data
-    const headers = [
-      "Doc Type", "Unique Number", "Date Issuance", "Supplier", "Recipient",
-      "Contract Number", "Date Dispatch", "Product Type", "Raw Material",
-      "Country Origin", "Quantity", "Unit", "Energy (MJ)", "GHG Total", "GHG Saving %",
-      "Compliance Status", "Recommended Action", "Match Confidence", "Matched Invoice",
-      "Discrepancies", "Warnings"
-    ];
-
-    const rows = certs.map(c => [
-      c.data?.docType, c.data?.uniqueNumber, c.data?.dateIssuance,
-      c.data?.issuer || c.data?.supplier, c.data?.recipient, c.data?.contractNumber,
-      c.data?.dateDispatch, c.data?.productType, c.data?.rawMaterial,
-      c.data?.rawMaterialOrigin, c.data?.quantity, c.data?.quantityUnit,
-      c.data?.energyContent, c.data?.ghgTotal, c.data?.ghgSaving,
-      c.analysis?.complianceStatus, c.analysis?.recommendedAction,
-      c.analysis?.matchConfidence, c.analysis?.matchedInvoice,
-      (c.analysis?.discrepancies || []).join("; "),
-      (c.analysis?.warnings || []).join("; ")
-    ]);
-
-    const csv = [headers, ...rows].map(r => r.map(v => `"${v ?? ""}"`).join(",")).join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `SAF_Certificates_Export_${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    addLog("✓ Export complete", "success");
-  }, [certs]);
+  const rejectMatch = useCallback(
+    async (cert) => {
+      setLoading(`Rejecting match for ${certTitle(cert)}...`);
+      try {
+        await persistMatch(
+          cert,
+          {
+            status: "rejected",
+            match_method: cert.match?.match_method || "manual",
+            cert_volume_m3: cert.match?.cert_volume_m3 ?? parseFlexibleNumber(cert.data?.quantity),
+            allocated_volume_m3: 0,
+            variance_m3: cert.match?.cert_volume_m3 ?? parseFlexibleNumber(cert.data?.quantity),
+            review_note: "Rejected during manual review.",
+            candidate_sets: cert.match?.candidate_sets || [],
+            linked_rows: [],
+          },
+          userEmail
+        );
+        addLog(`Rejected match for ${certTitle(cert)}`, "success");
+        setLoading("");
+        await loadFromDB();
+      } catch (error) {
+        setLoading("");
+        addLog(`Rejection failed: ${error.message}`, "error");
+      }
+    },
+    [addLog, loadFromDB, persistMatch, userEmail]
+  );
 
   const selectedCert = selected !== null ? certs[selected] : null;
-
-  // Stats
   const stats = {
-    total: certs.length,
-    compliant: certs.filter(c => c.analysis?.complianceStatus === "Compliant").length,
-    issues: certs.filter(c => c.analysis?.complianceStatus === "Non-Compliant").length,
-    review: certs.filter(c => c.analysis?.complianceStatus === "Needs Review").length,
+    totalCerts: certs.length,
+    matched: certs.filter((cert) => ["auto_linked", "approved"].includes(cert.match?.status)).length,
+    review: certs.filter((cert) => cert.match?.status === "needs_review").length,
+    unmatched: certs.filter((cert) => cert.match?.status === "unmatched").length,
+    allocatedRows: invoiceRows.filter((row) => row.is_allocated).length,
   };
 
   return (
-    <div style={{
-      fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
-      background: "#020b16",
-      minHeight: "100vh",
-      color: "#c8dff0",
-      display: "flex",
-      flexDirection: "column"
-    }}>
-      {/* Import Space Mono */}
+    <div
+      style={{
+        fontFamily: "'DM Sans', 'Segoe UI', sans-serif",
+        background: "#020b16",
+        minHeight: "100vh",
+        color: "#c8dff0",
+        display: "flex",
+        flexDirection: "column",
+      }}
+    >
+      {pdfPreview ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(2,11,22,0.82)",
+            zIndex: 1000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+          }}
+        >
+          <div
+            style={{
+              width: "min(1200px, 96vw)",
+              height: "min(92vh, 900px)",
+              background: "#04101d",
+              border: "1px solid #0d3060",
+              borderRadius: 12,
+              boxShadow: "0 20px 60px rgba(0,0,0,0.45)",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                padding: "14px 18px",
+                borderBottom: "1px solid #0d2040",
+                background: "#030d1a",
+              }}
+            >
+              <div>
+                <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 1 }}>
+                  CERTIFICATE PDF
+                </div>
+                <div style={{ color: "#e0f0ff", fontWeight: 600, fontSize: 14 }}>{pdfPreview.title}</div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <a
+                  href={pdfPreview.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    background: "#0a1628",
+                    color: "#4a9fd4",
+                    padding: "7px 12px",
+                    borderRadius: 6,
+                    fontFamily: "'Space Mono', monospace",
+                    fontSize: 10,
+                    border: "1px solid #0d3060",
+                    textDecoration: "none",
+                  }}
+                >
+                  OPEN IN NEW TAB
+                </a>
+                <button
+                  className="btn"
+                  onClick={() =>
+                    setPdfPreview((prev) => {
+                      if (prev?.url) URL.revokeObjectURL(prev.url);
+                      return null;
+                    })
+                  }
+                  style={{
+                    background: "#1a0000",
+                    color: "#ff6666",
+                    padding: "7px 12px",
+                    borderRadius: 6,
+                    fontFamily: "'Space Mono', monospace",
+                    fontSize: 10,
+                    border: "1px solid #ff444433",
+                  }}
+                >
+                  CLOSE
+                </button>
+              </div>
+            </div>
+            <iframe
+              title={pdfPreview.title}
+              src={pdfPreview.url}
+              style={{ flex: 1, width: "100%", border: "none", background: "#fff" }}
+            />
+          </div>
+        </div>
+      ) : null}
+
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
         * { box-sizing: border-box; }
@@ -938,608 +1490,549 @@ export default function SAFManager({ onLogout, userEmail }) {
         ::-webkit-scrollbar-thumb { background: #0d3060; border-radius: 2px; }
         input[type=file] { display: none; }
         .btn { cursor: pointer; border: none; transition: all 0.15s; }
-        .btn:hover { filter: brightness(1.15); }
-        .btn:active { transform: scale(0.97); }
-        .tab-btn { background: none; border: none; cursor: pointer; padding: 8px 16px; 
-          font-family: 'Space Mono', monospace; font-size: 11px; letter-spacing: 1px;
-          text-transform: uppercase; transition: all 0.15s; }
+        .btn:hover { filter: brightness(1.1); }
+        .tab-btn { background: none; border: none; cursor: pointer; padding: 8px 16px; font-family: 'Space Mono', monospace; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; transition: all 0.15s; }
       `}</style>
 
-      {/* Header */}
-      <div style={{
-        borderBottom: "1px solid #0d2040",
-        padding: "16px 28px",
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        background: "#030d1a"
-      }}>
+      <div
+        style={{
+          borderBottom: "1px solid #0d2040",
+          padding: "16px 28px",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          background: "#030d1a",
+        }}
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <div style={{
-            width: 36, height: 36, borderRadius: 8,
-            background: "linear-gradient(135deg,#0050aa,#00bfff)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 18, fontWeight: 900, color: "#fff", letterSpacing: -1
-          }}>✈</div>
+          <div
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 8,
+              background: "linear-gradient(135deg,#0050aa,#00bfff)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 18,
+              fontWeight: 900,
+              color: "#fff",
+            }}
+          >
+            ✈
+          </div>
           <div>
-            <div style={{ fontFamily: "'Space Mono',monospace", color: "#00bfff", fontSize: 13, letterSpacing: 2, fontWeight: 700 }}>
+            <div style={{ fontFamily: "'Space Mono', monospace", color: "#00bfff", fontSize: 13, letterSpacing: 2, fontWeight: 700 }}>
               TITAN AVIATION FUELS
             </div>
-            <div style={{ color: "#4a7fa0", fontSize: 10, letterSpacing: 1 }}>
-              SAF CERTIFICATE MANAGEMENT SYSTEM
-            </div>
+            <div style={{ color: "#4a7fa0", fontSize: 10, letterSpacing: 1 }}>SAF CERTIFICATE MATCHING SYSTEM</div>
           </div>
         </div>
+
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          {userEmail && (
-            <span style={{ fontFamily: "'Space Mono',monospace", fontSize: 10, color: "#4a7fa0", letterSpacing: 1 }}>
+          {invoiceImport ? (
+            <div style={{ color: "#4a7fa0", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
+              2025 CSV: {invoiceImport.filename} · {invoiceImport.row_count} rows
+            </div>
+          ) : null}
+          {userEmail ? (
+            <span style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: "#4a7fa0", letterSpacing: 1 }}>
               {userEmail}
             </span>
-          )}
-          {onLogout && (
-            <button className="btn" onClick={onLogout} style={{
-              background: "transparent", color: "#4a7fa0", padding: "5px 12px",
-              borderRadius: 5, fontFamily: "'Space Mono',monospace", fontSize: 10,
-              letterSpacing: 1, border: "1px solid #0d3060", cursor: "pointer"
-            }}>
+          ) : null}
+          {onLogout ? (
+            <button
+              className="btn"
+              onClick={onLogout}
+              style={{
+                background: "transparent",
+                color: "#4a7fa0",
+                padding: "5px 12px",
+                borderRadius: 5,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 10,
+                letterSpacing: 1,
+                border: "1px solid #0d3060",
+              }}
+            >
               SIGN OUT
             </button>
-          )}
-          {loading && (
-            <div style={{
-              color: loading.startsWith("[2/2]") ? "#aa00ff" : "#00bfff",
-              fontFamily: "'Space Mono',monospace", fontSize: 11,
-              padding: "6px 14px", background: loading.startsWith("[2/2]") ? "#aa00ff11" : "#00bfff11",
-              borderRadius: 6,
-              border: `1px solid ${loading.startsWith("[2/2]") ? "#aa00ff33" : "#00bfff33"}`,
-              animation: "pulse 1.5s infinite",
-              display: "flex", alignItems: "center", gap: 8
-            }}>
-              {loading.startsWith("[1/2]") && <span style={{ letterSpacing: 2 }}>■□</span>}
-              {loading.startsWith("[2/2]") && <span style={{ letterSpacing: 2, color: "#aa00ff" }}>■■</span>}
-              ⟳ {loading}
+          ) : null}
+          {loading ? (
+            <div
+              style={{
+                color: "#00bfff",
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 11,
+                padding: "6px 14px",
+                background: "#00bfff11",
+                borderRadius: 6,
+                border: "1px solid #00bfff33",
+              }}
+            >
+              {loading}
             </div>
-          )}
+          ) : null}
         </div>
       </div>
 
-      {/* Toolbar */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 10, padding: "12px 28px",
-        borderBottom: "1px solid #0d2040", background: "#030d1a"
-      }}>
-        {/* Upload PDF */}
-        <button className="btn" onClick={() => pdfInputRef.current?.click()} style={{
-          background: "#0050aa", color: "#fff", padding: "7px 16px", borderRadius: 6,
-          fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1
-        }}>
-          ＋ IMPORT PDF(s)
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          padding: "12px 28px",
+          borderBottom: "1px solid #0d2040",
+          background: "#030d1a",
+        }}
+      >
+        <button
+          className="btn"
+          onClick={() => pdfInputRef.current?.click()}
+          style={{
+            background: "#0050aa",
+            color: "#fff",
+            padding: "7px 16px",
+            borderRadius: 6,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 11,
+            letterSpacing: 1,
+          }}
+        >
+          IMPORT PDF(S)
         </button>
-        <input ref={pdfInputRef} type="file" accept=".pdf" multiple
-          onChange={e => handlePDFUpload(e.target.files)} />
+        <input ref={pdfInputRef} type="file" accept=".pdf" multiple onChange={(event) => handlePDFUpload(event.target.files)} />
 
-        {/* Upload CSV */}
-        <button className="btn" onClick={() => csvInputRef.current?.click()} style={{
-          background: "#0d2040", color: "#c8dff0", padding: "7px 16px", borderRadius: 6,
-          fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
-          border: "1px solid #1a4080"
-        }}>
-          📊 LOAD INVOICE CSV
+        <button
+          className="btn"
+          onClick={() => csvInputRef.current?.click()}
+          style={{
+            background: "#0d2040",
+            color: "#c8dff0",
+            padding: "7px 16px",
+            borderRadius: 6,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 11,
+            letterSpacing: 1,
+            border: "1px solid #1a4080",
+          }}
+        >
+          LOAD 2025 INVOICE CSV
         </button>
-        <input ref={csvInputRef} type="file" accept=".csv"
-          onChange={e => e.target.files[0] && handleCSVUpload(e.target.files[0])} />
+        <input ref={csvInputRef} type="file" accept=".csv,text/csv" onChange={(event) => event.target.files[0] && handleCSVUpload(event.target.files[0])} />
 
-        <button className="btn" onClick={loadFromDB} style={{
-          background: "#0a1628", color: "#4a9fd4", padding: "7px 14px", borderRadius: 6,
-          fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
-          border: "1px solid #0d3060"
-        }}>
-          🔄 RELOAD DB
-        </button>
-
-        <button className="btn" onClick={syncBucket} style={{
-          background: "#0a1628", color: "#f0c040", padding: "7px 14px", borderRadius: 6,
-          fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
-          border: "1px solid #403010"
-        }}>
-          ☁ SYNC BUCKET
+        <button
+          className="btn"
+          onClick={loadFromDB}
+          style={{
+            background: "#0a1628",
+            color: "#4a9fd4",
+            padding: "7px 14px",
+            borderRadius: 6,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 11,
+            letterSpacing: 1,
+            border: "1px solid #0d3060",
+          }}
+        >
+          RELOAD DB
         </button>
 
         <div style={{ flex: 1 }} />
 
-        {certs.length > 0 && (
+        {certs.length ? (
           <>
-            {certs.some(c => c.pdfPath) && (
-              <button className="btn" onClick={async () => {
-                for (let i = 0; i < certs.length; i++) {
-                  if (!certs[i]?.pdfPath) continue;
-                  await reExtractCert(i);
-                  if (i < certs.length - 1) await new Promise(r => setTimeout(r, 3000));
-                }
-              }} style={{
-                background: "#001428", color: "#4a9fd4", padding: "7px 16px", borderRadius: 6,
-                fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
-                border: "1px solid #0d3060"
-              }}>
-                ↺ RE-EXTRACT ALL
-              </button>
-            )}
-            <button className="btn" onClick={analyzeAll} style={{
-              background: "linear-gradient(135deg,#0050aa,#00bfff)", color: "#fff",
-              padding: "7px 18px", borderRadius: 6,
-              fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1
-            }}>
-              🤖 AI ANALYZE ALL
-            </button>
-            <button className="btn" onClick={exportXLSX} style={{
-              background: "#003322", color: "#00ff9d", padding: "7px 16px", borderRadius: 6,
-              fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1,
-              border: "1px solid #00ff9d44"
-            }}>
-              ↓ EXPORT CSV
+            <button
+              className="btn"
+              onClick={analyzeAll}
+              style={{
+                background: "linear-gradient(135deg,#0050aa,#00bfff)",
+                color: "#fff",
+                padding: "7px 18px",
+                borderRadius: 6,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 11,
+                letterSpacing: 1,
+              }}
+            >
+              MATCH ALL
             </button>
           </>
-        )}
+        ) : null}
       </div>
 
-      {/* Stats Bar */}
-      {certs.length > 0 && (
-        <div style={{
-          display: "flex", gap: 1, borderBottom: "1px solid #0d2040",
-          background: "#030d1a"
-        }}>
-          {[
-            { label: "TOTAL", val: stats.total, color: "#00bfff" },
-            { label: "COMPLIANT", val: stats.compliant, color: "#00ff9d" },
-            { label: "ISSUES", val: stats.issues, color: "#ff4444" },
-            { label: "REVIEW", val: stats.review, color: "#ffbb00" },
-            { label: "INVOICES", val: invoices.length, color: "#888" },
-          ].map(s => (
-            <div key={s.label} style={{
-              flex: 1, padding: "8px 20px", borderRight: "1px solid #0d2040"
-            }}>
-              <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 18, color: s.color, fontWeight: 700 }}>
-                {s.val}
-              </div>
-              <div style={{ color: "#4a7fa0", fontSize: 9, letterSpacing: 1 }}>{s.label}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Tabs */}
-      <div style={{ display: "flex", borderBottom: "1px solid #0d2040", background: "#030d1a" }}>
-        {[["certs", "📄 CERTIFICATES"], ["analysis", "🔍 ANALYSIS"], ["db", "📊 INVOICES"], ["log", "📋 LOG"]].map(([k, label]) => (
-          <button key={k} className="tab-btn" onClick={() => setTab(k)} style={{
-            color: tab === k ? "#00bfff" : "#4a7fa0",
-            borderBottom: tab === k ? "2px solid #00bfff" : "2px solid transparent",
-            marginBottom: -1
-          }}>{label}</button>
+      <div style={{ display: "flex", gap: 1, borderBottom: "1px solid #0d2040", background: "#030d1a" }}>
+        {[
+          { label: "CERTS", val: stats.totalCerts, color: "#00bfff" },
+          { label: "MATCHED", val: stats.matched, color: "#00ff9d" },
+          { label: "REVIEW", val: stats.review, color: "#ffbb00" },
+          { label: "UNMATCHED", val: stats.unmatched, color: "#ff6666" },
+          { label: "ALLOCATED ROWS", val: stats.allocatedRows, color: "#4a9fd4" },
+        ].map((item) => (
+          <div key={item.label} style={{ flex: 1, padding: "8px 20px", borderRight: "1px solid #0d2040" }}>
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 18, color: item.color, fontWeight: 700 }}>{item.val}</div>
+            <div style={{ color: "#4a7fa0", fontSize: 9, letterSpacing: 1 }}>{item.label}</div>
+          </div>
         ))}
       </div>
 
-      {/* Main Content */}
-      <div style={{ display: "flex", flex: 1, overflow: "hidden", height: "calc(100vh - 220px)" }}>
+      <div style={{ display: "flex", borderBottom: "1px solid #0d2040", background: "#030d1a" }}>
+        {[
+          ["certs", "CERTIFICATES"],
+          ["analysis", "MATCHING"],
+          ["db", "INVOICE ROWS"],
+          ["log", "LOG"],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            className="tab-btn"
+            onClick={() => setTab(key)}
+            style={{
+              color: tab === key ? "#00bfff" : "#4a7fa0",
+              borderBottom: tab === key ? "2px solid #00bfff" : "2px solid transparent",
+              marginBottom: -1,
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
 
-        {/* ── CERTIFICATES TAB ── */}
-        {tab === "certs" && (
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", height: "calc(100vh - 220px)" }}>
+        {tab === "certs" ? (
           <>
-            <div style={{
-              width: 300, borderRight: "1px solid #0d2040",
-              overflowY: "auto", padding: 12
-            }}>
-              {certs.length === 0 ? (
-                <div style={{
-                  padding: "40px 20px", textAlign: "center", color: "#4a7fa0"
-                }}>
+            <div style={{ width: 320, borderRight: "1px solid #0d2040", overflowY: "auto", padding: 12 }}>
+              {!certs.length ? (
+                <div style={{ padding: "40px 20px", textAlign: "center", color: "#4a7fa0" }}>
                   <div style={{ fontSize: 36, marginBottom: 12 }}>✈</div>
-                  <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
-                    Import SAF certificate PDFs to begin
-                  </div>
+                  <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>Import SAF certificate PDFs to begin</div>
                 </div>
-              ) : certs.map((c, i) => (
-                <CertCard key={i} cert={c} index={i}
-                  onSelect={setSelected} selected={selected === i}
-                  onAnalyze={analyzeSingle} onReExtract={reExtractCert} />
-              ))}
+              ) : (
+                certs.map((cert, index) => (
+                  <CertCard
+                    key={cert.id || index}
+                    cert={cert}
+                    index={index}
+                    selected={selected === index}
+                    onSelect={setSelected}
+                    onAnalyze={analyzeSingle}
+                    onReExtract={reExtractCert}
+                    onOpenPdf={openCertificatePdf}
+                  />
+                ))
+              )}
             </div>
 
             <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
               {selectedCert ? (
                 <div>
-                  <div style={{
-                    display: "flex", justifyContent: "space-between",
-                    alignItems: "center", marginBottom: 20
-                  }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
                     <div>
-                      <div style={{ fontFamily: "'Space Mono',monospace", color: "#00bfff", fontSize: 12 }}>
-                        {selectedCert.data?.docType}
+                      <div style={{ fontFamily: "'Space Mono', monospace", color: "#00bfff", fontSize: 12 }}>{selectedCert.data?.docType}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <div style={{ fontSize: 18, fontWeight: 600, color: "#e0f0ff" }}>{certTitle(selectedCert)}</div>
+                        {selectedCert.pdfPath ? (
+                          <button
+                            className="btn"
+                            onClick={() => openCertificatePdf(selectedCert)}
+                            style={{
+                              background: "#0a1628",
+                              color: "#4a9fd4",
+                              padding: "4px 10px",
+                              borderRadius: 5,
+                              fontFamily: "'Space Mono', monospace",
+                              fontSize: 10,
+                              border: "1px solid #0d3060",
+                            }}
+                          >
+                            OPEN PDF
+                          </button>
+                        ) : null}
                       </div>
-                      <div style={{ fontSize: 18, fontWeight: 600, color: "#e0f0ff" }}>
-                        {selectedCert.data?.uniqueNumber || selectedCert.filename}
+                      <div style={{ color: "#4a7fa0", fontSize: 11 }}>
+                        Cert volume: {formatVolume(selectedCert.data?.quantity)} {selectedCert.data?.quantityUnit || "m3"}
                       </div>
                     </div>
-                    {selectedCert.analysis && (
-                      <Badge status={selectedCert.analysis.complianceStatus} />
-                    )}
+                    {selectedCert.match ? <Badge status={selectedCert.match.status} /> : null}
                   </div>
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-                    {/* Party info */}
                     <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
-                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
                         PARTIES
                       </div>
-                      <FieldRow label="ISSUER" value={selectedCert.data?.issuer || selectedCert.data?.supplier} />
-                      <FieldRow label="ISSUER ADDR" value={selectedCert.data?.issuerAddress || selectedCert.data?.supplierAddress} />
-                      <FieldRow label="CERT NUMBER" value={selectedCert.data?.issuerCertNumber || selectedCert.data?.supplierCertNumber} />
-                      {selectedCert.data?.safSupplier && <FieldRow label="SAF SUPPLIER" value={selectedCert.data?.safSupplier} highlight />}
+                      <FieldRow label="ISSUER" value={selectedCert.data?.issuer} />
+                      <FieldRow label="SAF SUPPLIER" value={selectedCert.data?.safSupplier} highlight />
                       <FieldRow label="RECIPIENT" value={selectedCert.data?.recipient} />
-                      <FieldRow label="RECIPIENT ADDR" value={selectedCert.data?.recipientAddress} />
                       <FieldRow label="CONTRACT NR" value={selectedCert.data?.contractNumber} />
                     </div>
 
-                    {/* Logistics */}
                     <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
-                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
-                        LOGISTICS
+                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+                        DELIVERY
                       </div>
-                      <FieldRow label="DISPATCH ADDR" value={selectedCert.data?.dispatchAddress} />
-                      <FieldRow label="RECEIPT ADDR" value={selectedCert.data?.receiptAddress} />
                       <FieldRow label="DATE DISPATCH" value={selectedCert.data?.dateDispatch} />
-                      {selectedCert.data?.supplyPeriod && <FieldRow label="SUPPLY PERIOD" value={selectedCert.data?.supplyPeriod} />}
-                      {selectedCert.data?.deliveryAirports && <FieldRow label="AIRPORTS" value={selectedCert.data?.deliveryAirports} />}
+                      <FieldRow label="SUPPLY PERIOD" value={selectedCert.data?.supplyPeriod} />
+                      <FieldRow label="AIRPORTS" value={selectedCert.data?.deliveryAirports} />
                       <FieldRow label="ISSUED" value={selectedCert.data?.dateIssuance} />
                     </div>
 
-                    {/* Product */}
                     <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
-                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
-                        PRODUCT & FEEDSTOCK
+                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+                        PRODUCT
                       </div>
                       <FieldRow label="PRODUCT TYPE" value={selectedCert.data?.productType} />
-                      <FieldRow label="SAF TYPE" value={selectedCert.data?.safType} />
                       <FieldRow label="RAW MATERIAL" value={selectedCert.data?.rawMaterial} />
                       <FieldRow label="ORIGIN" value={selectedCert.data?.rawMaterialOrigin} />
-                      <FieldRow label="BIO QUANTITY" value={`${selectedCert.data?.quantity} ${selectedCert.data?.quantityUnit || "m³"}`} />
-                      {selectedCert.data?.totalVolume && <FieldRow label="TOTAL VOLUME" value={`${selectedCert.data?.totalVolume} ${selectedCert.data?.quantityUnit || "m³"}`} />}
-                      <FieldRow label="ENERGY (MJ)" value={selectedCert.data?.energyContent} />
-                      <FieldRow label="LCV (MJ/kg)" value={selectedCert.data?.lcv} />
-                      <FieldRow label="CHAIN" value={selectedCert.data?.chainOfCustody} />
-                      <FieldRow label="EU RED" value={selectedCert.data?.euRedCompliant} highlight />
-                      <FieldRow label="ISCC" value={selectedCert.data?.isccCompliant} />
-                      <FieldRow label="SCHEME" value={selectedCert.data?.complianceScheme} />
+                      <FieldRow label="SAF QUANTITY" value={`${formatVolume(selectedCert.data?.quantity)} ${selectedCert.data?.quantityUnit || "m3"}`} highlight />
                     </div>
 
-                    {/* underlyingPoSList */}
-                    {selectedCert.data?.underlyingPoSList?.length > 0 && (
-                      <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040", gridColumn: "1 / -1" }}>
-                        <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
-                          UNDERLYING PoS BATCHES
-                        </div>
-                        <div style={{ overflowX: "auto" }}>
-                          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono',monospace", fontSize: 10 }}>
-                            <thead>
-                              <tr style={{ borderBottom: "1px solid #0d3060" }}>
-                                {["PoS NUMBER", "RAW MATERIAL", "ORIGIN", "GHG TOTAL", "GHG SAVING", "QUANTITY", "UNIT"].map(h => (
-                                  <th key={h} style={{ padding: "6px 10px", textAlign: "left", color: "#00bfff", letterSpacing: 1, whiteSpace: "nowrap", fontSize: 9 }}>{h}</th>
-                                ))}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {selectedCert.data.underlyingPoSList.map((pos, pi) => (
-                                <tr key={pi} style={{ borderBottom: "1px solid #0d2040", background: pi % 2 === 0 ? "#060e1a" : "#030d1a" }}>
-                                  <td style={{ padding: "5px 10px", color: "#00bfff" }}>{pos.poSNumber || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#c8dff0" }}>{pos.rawMaterial || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#c8dff0" }}>{pos.origin || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#00ff9d" }}>{pos.ghgTotal || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#00ff9d" }}>{pos.ghgSaving || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#e0f0ff", fontWeight: 600 }}>{pos.quantity || "—"}</td>
-                                  <td style={{ padding: "5px 10px", color: "#888" }}>{pos.quantityUnit || "—"}</td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* GHG */}
                     <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
-                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono',monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
-                        GHG EMISSIONS
+                      <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+                        MATCH SUMMARY
                       </div>
-                      <div style={{
-                        display: "flex", justifyContent: "space-between",
-                        marginBottom: 14, padding: "8px 12px",
-                        background: "#001a0d", borderRadius: 6, border: "1px solid #00ff9d33"
-                      }}>
-                        <span style={{ color: "#4a7fa0", fontSize: 11 }}>TOTAL GHG</span>
-                        <span style={{ color: "#00ff9d", fontFamily: "'Space Mono',monospace", fontWeight: 700 }}>
-                          {selectedCert.data?.ghgTotal} gCO₂eq/MJ
-                        </span>
-                      </div>
-                      <div style={{
-                        display: "flex", justifyContent: "space-between",
-                        marginBottom: 14, padding: "8px 12px",
-                        background: "#001a0d", borderRadius: 6, border: "1px solid #00ff9d33"
-                      }}>
-                        <span style={{ color: "#4a7fa0", fontSize: 11 }}>GHG SAVING</span>
-                        <span style={{ color: "#00ff9d", fontFamily: "'Space Mono',monospace", fontWeight: 700 }}>
-                          {selectedCert.data?.ghgSaving}
-                        </span>
-                      </div>
-                      <GHGBar label="Eec (extraction)" value={selectedCert.data?.ghgEec} />
-                      <GHGBar label="El (land use)" value={selectedCert.data?.ghgEl} />
-                      <GHGBar label="Ep (processing)" value={selectedCert.data?.ghgEp} />
-                      <GHGBar label="Etd (transport)" value={selectedCert.data?.ghgEtd} />
-                      <GHGBar label="Eu (fuel use)" value={selectedCert.data?.ghgEu} />
+                      <FieldRow label="STATUS" value={selectedCert.match?.status?.replace(/_/g, " ")} highlight />
+                      <FieldRow label="METHOD" value={selectedCert.match?.match_method} />
+                      <FieldRow label="LINKED VOLUME" value={selectedCert.match ? `${formatVolume(selectedCert.match.allocated_volume_m3)} m3` : "—"} />
+                      <FieldRow label="VARIANCE" value={selectedCert.match ? `${formatVolume(selectedCert.match.variance_m3)} m3` : "—"} />
+                      <FieldRow label="NOTE" value={selectedCert.match?.review_note} />
+                    </div>
+
+                    <div style={{ gridColumn: "1 / -1" }}>
+                      <MatchRowsTable rows={selectedCert.match?.links || []} />
                     </div>
                   </div>
                 </div>
               ) : (
-                <div style={{ color: "#4a7fa0", padding: 40, textAlign: "center", fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
+                <div style={{ color: "#4a7fa0", padding: 40, textAlign: "center", fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
                   Select a certificate to view details
                 </div>
               )}
             </div>
           </>
-        )}
+        ) : null}
 
-        {/* ── ANALYSIS TAB ── */}
-        {tab === "analysis" && (
+        {tab === "analysis" ? (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-            {certs.filter(c => c.analysis).length === 0 ? (
+            {!certs.length ? (
               <div style={{ textAlign: "center", color: "#4a7fa0", padding: 60 }}>
                 <div style={{ fontSize: 36, marginBottom: 12 }}>🤖</div>
-                <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
-                  Click "AI ANALYZE ALL" to run compliance analysis
-                </div>
+                <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>Import certificates and your annual CSV to start matching.</div>
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                {certs.map((cert, i) => cert.analysis && (
-                  <div key={i} style={{
-                    background: "#060e1a", border: "1px solid #0d2040",
-                    borderRadius: 10, padding: 20,
-                    borderLeft: `4px solid ${
-                      cert.analysis.complianceStatus === "Compliant" ? "#00ff9d" :
-                      cert.analysis.complianceStatus === "Non-Compliant" ? "#ff4444" : "#ffbb00"
-                    }`
-                  }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+                {certs.map((cert) => (
+                  <div
+                    key={cert.id}
+                    style={{
+                      background: "#060e1a",
+                      border: "1px solid #0d2040",
+                      borderRadius: 10,
+                      padding: 20,
+                      borderLeft: `4px solid ${
+                        cert.match?.status === "auto_linked" || cert.match?.status === "approved"
+                          ? "#00ff9d"
+                          : cert.match?.status === "needs_review"
+                            ? "#ffbb00"
+                            : cert.match?.status === "rejected"
+                              ? "#ff4444"
+                              : "#4a7fa0"
+                      }`,
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 14 }}>
                       <div>
-                        <div style={{ fontFamily: "'Space Mono',monospace", color: "#00bfff", fontSize: 11 }}>
-                          {cert.data?.docType} · {cert.data?.dateDispatch}
+                        <div style={{ fontFamily: "'Space Mono', monospace", color: "#00bfff", fontSize: 11 }}>
+                          {cert.data?.docType} · {formatVolume(cert.data?.quantity)} {cert.data?.quantityUnit || "m3"}
                         </div>
-                        <div style={{ fontSize: 15, fontWeight: 600, color: "#e0f0ff", marginTop: 2 }}>
-                          {cert.data?.uniqueNumber || cert.filename}
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 2 }}>
+                          <div style={{ fontSize: 15, fontWeight: 600, color: "#e0f0ff" }}>{certTitle(cert)}</div>
+                          {cert.pdfPath ? (
+                            <button
+                              className="btn"
+                              onClick={() => openCertificatePdf(cert)}
+                              style={{
+                                background: "#0a1628",
+                                color: "#4a9fd4",
+                                padding: "4px 10px",
+                                borderRadius: 5,
+                                fontFamily: "'Space Mono', monospace",
+                                fontSize: 10,
+                                border: "1px solid #0d3060",
+                              }}
+                            >
+                              OPEN PDF
+                            </button>
+                          ) : null}
                         </div>
-                        <div style={{ color: "#4a7fa0", fontSize: 11 }}>
-                          {cert.data?.issuer || cert.data?.supplier} → {cert.data?.recipient}
-                        </div>
+                        <div style={{ color: "#4a7fa0", fontSize: 11 }}>{cert.match?.review_note || "Run matching for this certificate."}</div>
                       </div>
                       <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
-                        <Badge status={cert.analysis.complianceStatus} />
-                        <Badge status={cert.analysis.recommendedAction} />
-                        <div style={{ fontSize: 10, color: "#4a7fa0" }}>
-                          Match: <Badge status={cert.analysis.matchConfidence} />
-                        </div>
+                        {cert.match ? <Badge status={cert.match.status} /> : null}
+                        {cert.match?.match_method ? <Badge status={cert.match.match_method} /> : null}
                       </div>
                     </div>
 
-                    <div style={{ color: "#c8dff0", fontSize: 12, marginBottom: 12, lineHeight: 1.5 }}>
-                      {cert.analysis.complianceNotes}
-                    </div>
+                    {cert.match?.links?.length ? (
+                      <div style={{ marginBottom: 14 }}>
+                        <MatchRowsTable rows={cert.match.links} title="LOCKED INVOICE ROWS" />
+                      </div>
+                    ) : null}
 
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-                      {cert.analysis.matchedInvoice && (
-                        <div style={{ background: "#001a0d", borderRadius: 6, padding: 10, border: "1px solid #00ff9d22" }}>
-                          <div style={{ color: "#4a7fa0", fontSize: 9, marginBottom: 4 }}>MATCHED INVOICE</div>
-                          <div style={{ color: "#00ff9d", fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
-                            {cert.analysis.matchedInvoice}
-                          </div>
-                          {cert.analysis.matchedInvoiceRows?.map((ref, k) => (
-                            <div key={k} style={{ color: "#88ffcc", fontSize: 9, marginTop: 2 }}>• {ref}</div>
-                          ))}
+                    {cert.match?.status === "needs_review" ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                        <div
+                          style={{
+                            background: "#111a28",
+                            border: "1px solid #1a304f",
+                            borderRadius: 8,
+                            padding: "10px 12px",
+                            color: "#c8dff0",
+                            fontSize: 12,
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          Each candidate below is an alternative invoice group. Approving one group links all rows in that group to this certificate. The other candidate groups are not linked.
                         </div>
-                      )}
-
-                      {cert.analysis.discrepancies?.length > 0 && (
-                        <div style={{ background: "#1a0000", borderRadius: 6, padding: 10, border: "1px solid #ff444422" }}>
-                          <div style={{ color: "#ff4444", fontSize: 9, marginBottom: 4 }}>DISCREPANCIES</div>
-                          {cert.analysis.discrepancies.map((d, j) => (
-                            <div key={j} style={{ color: "#ffaaaa", fontSize: 10, marginBottom: 2 }}>• {d}</div>
-                          ))}
-                        </div>
-                      )}
-
-                      {cert.analysis.warnings?.length > 0 && (
-                        <div style={{ background: "#1a1200", borderRadius: 6, padding: 10, border: "1px solid #ffbb0022" }}>
-                          <div style={{ color: "#ffbb00", fontSize: 9, marginBottom: 4 }}>WARNINGS</div>
-                          {cert.analysis.warnings.map((w, j) => (
-                            <div key={j} style={{ color: "#ffdd88", fontSize: 10, marginBottom: 2 }}>• {w}</div>
-                          ))}
-                        </div>
-                      )}
-
-                      {cert.analysis.matchReasons?.length > 0 && (
-                        <div style={{ background: "#001020", borderRadius: 6, padding: 10, border: "1px solid #00bfff22" }}>
-                          <div style={{ color: "#00bfff", fontSize: 9, marginBottom: 4 }}>MATCH REASONS</div>
-                          {cert.analysis.matchReasons.map((r, j) => (
-                            <div key={j} style={{ color: "#88ccff", fontSize: 10, marginBottom: 2 }}>• {r}</div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Quick checks */}
-                    <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-                      {[
-                        ["GHG Saving OK", cert.analysis.ghgSavingOk],
-                        ["Quantity Match", cert.analysis.quantityMatch],
-                        ["Supplier Verified", cert.analysis.supplierVerified],
-                        ["Airports Verified", cert.analysis.airportsVerified],
-                        ["Contract Ref Found", cert.analysis.contractRefFound],
-                      ].filter(([, v]) => v !== undefined).map(([label, ok]) => (
-                        <div key={label} style={{
-                          padding: "4px 10px", borderRadius: 4, fontSize: 10,
-                          background: ok ? "#001a0d" : "#1a0000",
-                          color: ok ? "#00ff9d" : "#ff6666",
-                          border: `1px solid ${ok ? "#00ff9d33" : "#ff444433"}`,
-                          fontFamily: "'Space Mono',monospace"
-                        }}>
-                          {ok ? "✓" : "✗"} {label}
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* Complex PoC Attribution Table */}
-                    {cert.analysis.isComplexPoC && cert.analysis.attribution && (
-                      <div style={{ marginTop: 20 }}>
-                        <div style={{
-                          background: "#110022", border: "1px solid #aa00ff44",
-                          borderRadius: 8, padding: 16
-                        }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                            <div style={{ color: "#aa00ff", fontFamily: "'Space Mono',monospace", fontSize: 11, letterSpacing: 1 }}>
-                              CLIENT ATTRIBUTION · <Badge status={cert.analysis.attribution.attributionStatus || "None"} />
-                            </div>
-                            <div style={{ fontSize: 10, color: "#888", fontFamily: "'Space Mono',monospace" }}>
-                              {cert.analysis.attribution.attributionNotes}
-                            </div>
-                          </div>
-
-                          {/* Summary bar */}
-                          <div style={{ display: "flex", gap: 16, marginBottom: 14 }}>
-                            <div style={{ background: "#001a0d", borderRadius: 6, padding: "8px 14px", border: "1px solid #00ff9d22", flex: 1 }}>
-                              <div style={{ color: "#4a7fa0", fontSize: 9, marginBottom: 2 }}>ATTRIBUTED VOLUME</div>
-                              <div style={{ color: "#00ff9d", fontFamily: "'Space Mono',monospace", fontSize: 12, fontWeight: 700 }}>
-                                {cert.analysis.attribution.totalAttributedVolume || "—"}
-                              </div>
-                            </div>
-                            <div style={{ background: "#1a0a00", borderRadius: 6, padding: "8px 14px", border: "1px solid #ff990022", flex: 1 }}>
-                              <div style={{ color: "#4a7fa0", fontSize: 9, marginBottom: 2 }}>UNATTRIBUTED VOLUME</div>
-                              <div style={{ color: "#ff9900", fontFamily: "'Space Mono',monospace", fontSize: 12, fontWeight: 700 }}>
-                                {cert.analysis.attribution.totalUnattributedVolume || "—"}
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Attribution table */}
-                          {cert.analysis.attribution.clientAttribution?.length > 0 && (
-                            <div style={{ overflowX: "auto", marginBottom: 14 }}>
-                              <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono',monospace", fontSize: 10 }}>
-                                <thead>
-                                  <tr style={{ borderBottom: "1px solid #aa00ff33" }}>
-                                    {["CUSTOMER", "AIRPORT", "MONTH", "CERT VOL", "INVOICED VOL", "MATCH", "CONFIDENCE", "INVOICES"].map(h => (
-                                      <th key={h} style={{ padding: "6px 10px", textAlign: "left", color: "#aa00ff", letterSpacing: 1, whiteSpace: "nowrap", fontSize: 9 }}>{h}</th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {cert.analysis.attribution.clientAttribution.map((row, ri) => (
-                                    <React.Fragment key={`attr-${ri}`}>
-                                      <tr style={{ borderBottom: "1px solid #1a0033", background: ri % 2 === 0 ? "#0d0022" : "#110022" }}>
-                                        <td style={{ padding: "5px 10px", color: "#e0f0ff" }}>{row.customer}</td>
-                                        <td style={{ padding: "5px 10px", color: "#00bfff" }}>{row.airport}</td>
-                                        <td style={{ padding: "5px 10px", color: "#888" }}>{row.month || "—"}</td>
-                                        <td style={{ padding: "5px 10px", color: "#c8dff0" }}>{row.certVolume}</td>
-                                        <td style={{ padding: "5px 10px", color: "#c8dff0" }}>{row.invoicedVolume}</td>
-                                        <td style={{ padding: "5px 10px" }}>
-                                          <span style={{ color: row.matched ? "#00ff9d" : "#ff4444", fontWeight: 700 }}>
-                                            {row.matched ? "✓" : "✗"}
-                                          </span>
-                                        </td>
-                                        <td style={{ padding: "5px 10px" }}><Badge status={row.confidence} /></td>
-                                        <td style={{ padding: "5px 10px" }}>
-                                          {row.invoiceRefs?.length > 0 && (
-                                            <button onClick={() => setExpandedAttributionRow(expandedAttributionRow === ri ? null : ri)}
-                                              style={{ color: "#aa00ff", background: "none", border: "1px solid #aa00ff44",
-                                                       borderRadius: 4, padding: "2px 6px", fontSize: 9, cursor: "pointer" }}>
-                                              ▶ {row.invoiceRefs.length}
-                                            </button>
-                                          )}
-                                        </td>
-                                      </tr>
-                                      {expandedAttributionRow === ri && (
-                                        <tr>
-                                          <td colSpan={8} style={{ background: "#0a0018", padding: "8px 16px", borderBottom: "1px solid #aa00ff44" }}>
-                                            {row.invoiceRefs.map((ref, k) => (
-                                              <div key={k} style={{ color: "#cc88ff", fontSize: 10, fontFamily: "'Space Mono',monospace", marginBottom: 2 }}>• {ref}</div>
-                                            ))}
-                                          </td>
-                                        </tr>
-                                      )}
-                                    </React.Fragment>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          )}
-
-                          {/* Unattributed slots */}
-                          {cert.analysis.attribution.unattributedSlots?.length > 0 && (
-                            <div style={{ background: "#1a1000", border: "1px solid #ffbb0022", borderRadius: 6, padding: 10 }}>
-                              <div style={{ color: "#ffbb00", fontSize: 9, marginBottom: 6, fontFamily: "'Space Mono',monospace", letterSpacing: 1 }}>
-                                UNATTRIBUTED SLOTS
-                              </div>
-                              {cert.analysis.attribution.unattributedSlots.map((slot, si) => (
-                                <div key={si} style={{ color: "#ffdd88", fontSize: 10, marginBottom: 3 }}>
-                                  • {slot.airport}{slot.month ? ` · ${slot.month}` : ""} — {slot.certVolume} — {slot.reason}
+                        {(cert.match.candidate_sets || []).map((candidate, candidateIndex) => {
+                          const isExpanded = expandedCandidates[`${cert.id}-${candidateIndex}`];
+                          return (
+                            <div key={`${cert.id}-${candidateIndex}`} style={{ background: "#091220", borderRadius: 8, border: "1px solid #1a304f", padding: 14 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                                <div>
+                                  <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
+                                    Candidate {candidateIndex + 1} · {candidate.match_method}
+                                  </div>
+                                  <div style={{ color: "#c8dff0", fontSize: 12 }}>
+                                    {formatVolume(candidate.total_volume_m3)} m3 linked · variance {formatVolume(candidate.variance_m3)} m3
+                                  </div>
                                 </div>
-                              ))}
+                                <div style={{ display: "flex", gap: 8 }}>
+                                  <button
+                                    className="btn"
+                                    onClick={() => approveCandidate(cert, candidateIndex)}
+                                    style={{
+                                      background: "#003322",
+                                      color: "#00ff9d",
+                                      padding: "6px 12px",
+                                      borderRadius: 5,
+                                      fontFamily: "'Space Mono', monospace",
+                                      fontSize: 10,
+                                      border: "1px solid #00ff9d44",
+                                    }}
+                                  >
+                                    APPROVE THIS GROUP
+                                  </button>
+                                  <button
+                                    className="btn"
+                                    onClick={() =>
+                                      setExpandedCandidates((prev) => ({
+                                        ...prev,
+                                        [`${cert.id}-${candidateIndex}`]: !prev[`${cert.id}-${candidateIndex}`],
+                                      }))
+                                    }
+                                    style={{
+                                      background: "#0a1628",
+                                      color: "#4a9fd4",
+                                      padding: "6px 12px",
+                                      borderRadius: 5,
+                                      fontFamily: "'Space Mono', monospace",
+                                      fontSize: 10,
+                                      border: "1px solid #0d3060",
+                                    }}
+                                  >
+                                    {isExpanded ? "HIDE ROWS" : "SHOW ROWS"}
+                                  </button>
+                                </div>
+                              </div>
+                              {isExpanded ? (
+                                <div style={{ marginTop: 12 }}>
+                                  <MatchRowsTable rows={candidate.rows} title="CANDIDATE ROWS" emptyText="No rows in this candidate." />
+                                </div>
+                              ) : null}
                             </div>
-                          )}
+                          );
+                        })}
+                        <div>
+                          <button
+                            className="btn"
+                            onClick={() => rejectMatch(cert)}
+                            style={{
+                              background: "#1a0000",
+                              color: "#ff6666",
+                              padding: "6px 12px",
+                              borderRadius: 5,
+                              fontFamily: "'Space Mono', monospace",
+                              fontSize: 10,
+                              border: "1px solid #ff444433",
+                            }}
+                          >
+                            REJECT
+                          </button>
                         </div>
                       </div>
-                    )}
+                    ) : null}
+
+                    {!cert.match ? (
+                      <button
+                        className="btn"
+                        onClick={() => analyzeSingle(certs.findIndex((item) => item.id === cert.id))}
+                        style={{
+                          background: "linear-gradient(135deg,#0050aa,#00bfff)",
+                          color: "#fff",
+                          padding: "7px 14px",
+                          borderRadius: 6,
+                          fontFamily: "'Space Mono', monospace",
+                          fontSize: 11,
+                          letterSpacing: 1,
+                        }}
+                      >
+                        MATCH NOW
+                      </button>
+                    ) : null}
                   </div>
                 ))}
               </div>
             )}
           </div>
-        )}
+        ) : null}
 
-        {/* ── INVOICES DB TAB ── */}
-        {tab === "db" && (
+        {tab === "db" ? (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-            {invoices.length === 0 ? (
+            {!invoiceRows.length ? (
               <div style={{ textAlign: "center", color: "#4a7fa0", padding: 60 }}>
                 <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
-                <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
-                  Load a CSV file with your invoice records
-                </div>
-                <div style={{ fontSize: 10, marginTop: 8, color: "#2a5070" }}>
-                  Expected columns: Invoice Nr, Supplier, Date, Quantity, SAF Volume, Airport...
-                </div>
+                <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>Load the 2025 invoice CSV to create row-level matches.</div>
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
-                <table style={{
-                  width: "100%", borderCollapse: "collapse",
-                  fontFamily: "'Space Mono',monospace", fontSize: 10
-                }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
                   <thead>
                     <tr style={{ borderBottom: "2px solid #0d3060" }}>
-                      {Object.keys(invoices[0]).map(h => (
-                        <th key={h} style={{
-                          padding: "8px 12px", textAlign: "left",
-                          color: "#00bfff", letterSpacing: 1, whiteSpace: "nowrap"
-                        }}>{h.toUpperCase()}</th>
-                      ))}
+                      {["STATUS", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "VOL M3"].map(
+                        (header) => (
+                          <th key={header} style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
+                            {header}
+                          </th>
+                        )
+                      )}
                     </tr>
                   </thead>
                   <tbody>
-                    {invoices.map((row, i) => (
-                      <tr key={i} style={{
-                        borderBottom: "1px solid #0d2040",
-                        background: i % 2 === 0 ? "#060e1a" : "#030d1a"
-                      }}>
-                        {Object.values(row).map((v, j) => (
-                          <td key={j} style={{
-                            padding: "7px 12px", color: "#c8dff0",
-                            fontSize: 10, whiteSpace: "nowrap"
-                          }}>{v}</td>
-                        ))}
+                    {invoiceRows.map((row, index) => (
+                      <tr key={row.id || index} style={{ borderBottom: "1px solid #0d2040", background: index % 2 === 0 ? "#060e1a" : "#030d1a" }}>
+                        <td style={{ padding: "7px 12px" }}>
+                          <Badge status={row.is_allocated ? "allocated" : "free"} />
+                        </td>
+                        <td style={{ padding: "7px 12px", color: "#4a9fd4" }}>{row.row_number}</td>
+                        <td style={{ padding: "7px 12px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.customer || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#888" }}>{row.uplift_date || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.iata || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.icao || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.country || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.supplier || "—"}</td>
+                        <td style={{ padding: "7px 12px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.vol_m3)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -1547,29 +2040,30 @@ export default function SAFManager({ onLogout, userEmail }) {
               </div>
             )}
           </div>
-        )}
+        ) : null}
 
-        {/* ── LOG TAB ── */}
-        {tab === "log" && (
+        {tab === "log" ? (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
-            <div style={{ fontFamily: "'Space Mono',monospace", fontSize: 11 }}>
-              {log.length === 0 ? (
+            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
+              {!log.length ? (
                 <div style={{ color: "#4a7fa0" }}>No activity yet</div>
-              ) : [...log].reverse().map((entry, i) => (
-                <div key={i} style={{
-                  display: "flex", gap: 12, padding: "5px 0",
-                  borderBottom: "1px solid #0d2040"
-                }}>
-                  <span style={{ color: "#2a5070", width: 80, flexShrink: 0 }}>{entry.ts}</span>
-                  <span style={{
-                    color: entry.type === "success" ? "#00ff9d" :
-                      entry.type === "error" ? "#ff4444" : "#4a7fa0"
-                  }}>{entry.msg}</span>
-                </div>
-              ))}
+              ) : (
+                [...log].reverse().map((entry, index) => (
+                  <div key={`${entry.ts}-${index}`} style={{ display: "flex", gap: 12, padding: "5px 0", borderBottom: "1px solid #0d2040" }}>
+                    <span style={{ color: "#2a5070", width: 80, flexShrink: 0 }}>{entry.ts}</span>
+                    <span
+                      style={{
+                        color: entry.type === "success" ? "#00ff9d" : entry.type === "error" ? "#ff4444" : "#4a7fa0",
+                      }}
+                    >
+                      {entry.msg}
+                    </span>
+                  </div>
+                ))
+              )}
             </div>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
