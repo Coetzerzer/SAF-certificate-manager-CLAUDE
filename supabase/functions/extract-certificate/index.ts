@@ -23,10 +23,17 @@ Extract ALL of the following fields from this certificate PDF. Return ONLY a val
   "contractNumber": "all contract references found (comma-separated if multiple, e.g. LMT21482_1576, LMT22430_1576)",
   "dispatchAddress": "",
   "receiptAddress": "",
+  "additionalInformation": "free-text from 'Additional Information' or similar notes field",
   "supplyPeriod": "for PoC: the full supply period, e.g. '01/01/2025 – 31/12/2025'",
   "dateDispatch": "for PoS: the actual dispatch date; leave empty for PoC",
   "physicalDeliveryAirport": "ICAO or name of the main physical delivery airport",
   "deliveryAirports": "all delivery airports listed (comma-separated ICAO/IATA codes)",
+  "matchingMode": "monthly-pos | uplift-pos | poc",
+  "coverageGranularity": "month | day | period",
+  "coverageMonth": "YYYY-MM when the document covers one month",
+  "coverageStart": "YYYY-MM-DD",
+  "coverageEnd": "YYYY-MM-DD",
+  "matchingEvidence": "short explanation of why matchingMode/coverage were chosen",
   "productType": "",
   "rawMaterial": "",
   "rawMaterialOrigin": "",
@@ -79,6 +86,18 @@ IMPORTANT RULES:
 - For PoS, "dateDispatch" must be the "Date of dispatch of the sustainable material" (or equivalent transport/dispatch wording). Do NOT copy the certificate issue/signature/issuance date into "dateDispatch".
 - For PoC, "supplyPeriod" is the reconciliation date field. Leave "dateDispatch" empty unless the document truly provides a dispatch date for the sustainable material.
 - "dateIssuance" is only the document issue/signature date and must never be used as uplift/dispatch date.
+- Extract "additionalInformation" from the document when present, especially "Additional Information (voluntary)" style fields.
+- matchingMode rules:
+  - Use "poc" for PoC documents.
+  - Use "monthly-pos" for one-airport PoS documents that represent a monthly certified quantity, especially when the document or notes say things like "SAF Delivery February 2025".
+  - Use "uplift-pos" only when the document clearly refers to a single shipment / uplift / delivery event rather than a monthly airport total.
+- For one-airport PoS documents with no clear single-uplift evidence, prefer "monthly-pos".
+- coverage rules:
+  - For "monthly-pos", set "coverageGranularity" = "month", infer "coverageMonth" as YYYY-MM, and set "coverageStart"/"coverageEnd" to the first and last day of that month.
+  - If the document says e.g. "SAF Delivery February 2025", use that month for coverage even if "dateDispatch" is the month-end date.
+  - For "uplift-pos", set "coverageGranularity" = "day" and set "coverageStart" = "coverageEnd" = the actual uplift/dispatch date.
+  - For "poc", set "coverageGranularity" = "period" and use the documented supply period where possible.
+- "matchingEvidence" should be a short phrase like "additional-information-month", "single-airport-pos-default", "explicit-uplift-wording", or "poc-supply-period".
 - contractNumber: capture ALL contract references (look for EXTRANET refs, LMT numbers, contract IDs).
 - isComplexPoC: set to "true" if this is a PoC covering 3 or more airports with a breakdown table of volumes per month. Otherwise "false" or "".
 - monthlyVolumes: if the document contains a table with volumes broken down by month AND airport, extract each row as an entry with "month" (YYYY-MM), "airport" (ICAO or IATA code), "quantity", "quantityUnit". Leave as [] if no such table exists.
