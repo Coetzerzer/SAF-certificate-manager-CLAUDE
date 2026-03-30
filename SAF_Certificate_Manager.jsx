@@ -3062,6 +3062,49 @@ export default function SAFManager({ onLogout, userEmail }) {
     [syncCertificateAllocationUnits]
   );
 
+  const backfillMissingSafVolumes = useCallback(async (invoiceRowsData) => {
+    if (!invoiceRowsData?.length) return { rows: invoiceRowsData || [], updatedCount: 0 };
+
+    const safAliases = INVOICE_HEADER_ALIASES.saf_vol_m3;
+    const rowsNeedingBackfill = invoiceRowsData.filter((row) => {
+      if (normalizeVolumeNumber(row.saf_vol_m3) > 0) return false;
+      if (!row.raw_payload || typeof row.raw_payload !== "object") return false;
+      const keys = Object.keys(row.raw_payload);
+      return safAliases.some((alias) => resolveHeader(keys, [alias]) && parseFlexibleNumber(row.raw_payload[resolveHeader(keys, [alias])]) > 0);
+    });
+
+    if (!rowsNeedingBackfill.length) return { rows: invoiceRowsData, updatedCount: 0 };
+
+    const resolvedRows = rowsNeedingBackfill.map((row) => {
+      const keys = Object.keys(row.raw_payload);
+      for (const alias of safAliases) {
+        const header = resolveHeader(keys, [alias]);
+        if (header) {
+          const val = parseFlexibleNumber(row.raw_payload[header]);
+          if (val > 0) return { id: row.id, saf_vol_m3: val };
+        }
+      }
+      return null;
+    }).filter(Boolean);
+
+    for (let i = 0; i < resolvedRows.length; i += 100) {
+      const chunk = resolvedRows.slice(i, i + 100);
+      await Promise.all(
+        chunk.map(async ({ id, saf_vol_m3 }) => {
+          const { error } = await supabase.from("invoice_rows").update({ saf_vol_m3 }).eq("id", id);
+          if (error) throw error;
+        })
+      );
+    }
+
+    const updatedRows = invoiceRowsData.map((row) => {
+      const resolved = resolvedRows.find((r) => r.id === row.id);
+      return resolved ? { ...row, saf_vol_m3: resolved.saf_vol_m3 } : row;
+    });
+
+    return { rows: updatedRows, updatedCount: resolvedRows.length };
+  }, []);
+
   const backfillInvoiceRowValidationState = useCallback(
     async (invoiceImportRow, invoiceRowsData) => {
       if (!invoiceImportRow?.id || !invoiceRowsData?.length) {
@@ -3292,6 +3335,16 @@ export default function SAFManager({ onLogout, userEmail }) {
         }
 
         try {
+          const safBackfillRes = await backfillMissingSafVolumes(invoiceRowsData);
+          if (safBackfillRes.updatedCount) {
+            invoiceRowsData = safBackfillRes.rows;
+            if (isCurrentRequest()) addLog(`Backfilled saf_vol_m3 for ${safBackfillRes.updatedCount} invoice row(s) from raw_payload`, "info");
+          }
+        } catch (error) {
+          if (isCurrentRequest()) addLog(`SAF volume backfill warning: ${error.message}`, "error");
+        }
+
+        try {
           const invoiceBackfillRes = await backfillInvoiceRowValidationState(latestImport, invoiceRowsData);
           invoiceRowsData = invoiceBackfillRes.rows;
           if ((invoiceBackfillRes.updatedCount || invoiceBackfillRes.importUpdated) && isCurrentRequest()) {
@@ -3395,7 +3448,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     } catch (error) {
       if (isCurrentRequest()) addLog(`DB reload failed: ${error.message}`, "error");
     }
-  }, [addLog, backfillInvoiceRowValidationState, backfillMissingAllocationUnits]);
+  }, [addLog, backfillInvoiceRowValidationState, backfillMissingAllocationUnits, backfillMissingSafVolumes]);
 
   useEffect(() => {
     if (initialLoadStartedRef.current) return;
