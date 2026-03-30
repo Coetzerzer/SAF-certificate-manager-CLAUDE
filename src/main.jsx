@@ -1,7 +1,68 @@
-import { StrictMode, useState, useEffect } from 'react'
+import React, { StrictMode, useState, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import SAFManager from '../SAF_Certificate_Manager.jsx'
 import { supabase } from './supabase.js'
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error('App render error:', error);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          background: '#030d1a',
+          color: '#c8dff0',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+          fontFamily: "'Space Mono', monospace",
+        }}
+      >
+        <div
+          style={{
+            width: 'min(860px, 92vw)',
+            background: '#0a1628',
+            border: '1px solid #6b2020',
+            borderRadius: 10,
+            padding: 24,
+          }}
+        >
+          <div style={{ color: '#ff6b6b', fontSize: 12, letterSpacing: 2, marginBottom: 12 }}>RUNTIME ERROR</div>
+          <div style={{ color: '#e0f0ff', fontSize: 14, marginBottom: 12 }}>
+            The app crashed while rendering. The error is shown below instead of a blank page.
+          </div>
+          <pre
+            style={{
+              margin: 0,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              color: '#ffb3b3',
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            {String(this.state.error?.stack || this.state.error?.message || this.state.error)}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+}
 
 function LoginPage({ onLogin }) {
   const [email, setEmail] = useState('');
@@ -132,6 +193,8 @@ function App() {
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
-    <App />
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
   </StrictMode>
 )

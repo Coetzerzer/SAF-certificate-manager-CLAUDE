@@ -1,0 +1,40 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: ✈
+      - generic [ref=e7]:
+        - generic [ref=e8]: TITAN AVIATION FUELS
+        - generic [ref=e9]: SAF CERTIFICATE MATCHING SYSTEM
+    - generic [ref=e10]:
+      - generic [ref=e11]: alexisc@titanfuels.aero
+      - button "SIGN OUT" [ref=e12] [cursor=pointer]
+  - generic [ref=e13]:
+    - button "IMPORT PDF(S)" [ref=e14] [cursor=pointer]
+    - button "LOAD 2025 INVOICE CSV" [ref=e15] [cursor=pointer]
+    - button "RELOAD DB" [ref=e16] [cursor=pointer]
+  - generic [ref=e17]:
+    - generic [ref=e18]:
+      - generic [ref=e19]: "0"
+      - generic [ref=e20]: CERTS
+    - generic [ref=e21]:
+      - generic [ref=e22]: "0"
+      - generic [ref=e23]: MATCHED
+    - generic [ref=e24]:
+      - generic [ref=e25]: "0"
+      - generic [ref=e26]: REVIEW
+    - generic [ref=e27]:
+      - generic [ref=e28]: "0"
+      - generic [ref=e29]: UNMATCHED
+    - generic [ref=e30]:
+      - generic [ref=e31]: "0"
+      - generic [ref=e32]: ALLOCATED ROWS
+  - generic [ref=e33]:
+    - button "CERTIFICATES" [ref=e34] [cursor=pointer]
+    - button "MATCHING" [ref=e35] [cursor=pointer]
+    - button "INVOICE ROWS" [ref=e36] [cursor=pointer]
+    - button "LOG" [ref=e37] [cursor=pointer]
+  - generic [ref=e38]:
+    - generic [ref=e40]:
+      - generic [ref=e41]: ✈
+      - generic [ref=e42]: Import SAF certificate PDFs to begin
+    - generic [ref=e44]: Select a certificate to view details
