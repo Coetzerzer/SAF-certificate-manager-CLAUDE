@@ -2814,20 +2814,29 @@ function MatchRowsTable({ rows, title = "LINKED INVOICE ROWS", emptyText = "No l
   );
 }
 
-function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onOpenPdf }) {
+function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onOpenPdf, hasClientCert }) {
   const status = cert.match?.status;
+  const isCompleted = status === "approved" && hasClientCert;
+  const borderLeftColor =
+    isCompleted ? "#00ff9d" :
+    status === "approved" ? "#00cc7a" :
+    status === "auto_linked" ? "#00bfff" :
+    status === "unmatched" ? "#ff6666" :
+    status === "manual_only" ? "#ffbb00" : "#334";
   return (
     <div
       onClick={() => onSelect(index)}
       style={{
         background: selected ? "#0a1628" : "#060e1a",
         border: selected ? "1px solid #00bfff" : "1px solid #0d2040",
+        borderLeft: `4px solid ${borderLeftColor}`,
         borderRadius: 8,
         padding: "14px 18px",
         cursor: "pointer",
         marginBottom: 8,
         transition: "all 0.15s",
         boxShadow: selected ? "0 0 16px #00bfff33" : "none",
+        opacity: isCompleted ? 0.5 : 1,
       }}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
@@ -2868,24 +2877,28 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
         <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
           <Badge status={cert.document_family || cert.data?.document_family || "unknown"} />
           {status ? <Badge status={status} /> : null}
-          <button
-            className="btn"
-            onClick={(event) => {
-              event.stopPropagation();
-              onAnalyze(index);
-            }}
-            style={{
-              background: "linear-gradient(135deg,#0050aa,#00bfff)",
-              color: "#fff",
-              padding: "3px 10px",
-              borderRadius: 4,
-              fontFamily: "'Space Mono', monospace",
-              fontSize: 10,
-              letterSpacing: 1,
-            }}
-          >
-            RUN
-          </button>
+          {isCompleted ? (
+            <span style={{ color: "#00ff9d", fontSize: 10, fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>✓ DONE</span>
+          ) : (
+            <button
+              className="btn"
+              onClick={(event) => {
+                event.stopPropagation();
+                onAnalyze(index);
+              }}
+              style={{
+                background: "linear-gradient(135deg,#0050aa,#00bfff)",
+                color: "#fff",
+                padding: "3px 10px",
+                borderRadius: 4,
+                fontFamily: "'Space Mono', monospace",
+                fontSize: 10,
+                letterSpacing: 1,
+              }}
+            >
+              RUN
+            </button>
+          )}
           {cert.pdfPath ? (
             <button
               className="btn"
@@ -3105,6 +3118,7 @@ function CoverageTable({ coverageData, airportFilter, setAirportFilter, clientSe
 export default function SAFManager({ onLogout, userEmail }) {
   const [certs, setCerts] = useState([]);
   const [selected, setSelected] = useState(null);
+  const [certStatusFilter, setCertStatusFilter] = useState("");
   const [invoiceRows, setInvoiceRows] = useState([]);
   const [invoiceImport, setInvoiceImport] = useState(null);
   const [clientCertificateRecords, setClientCertificateRecords] = useState([]);
@@ -4433,13 +4447,14 @@ export default function SAFManager({ onLogout, userEmail }) {
         const freshData = await loadFromDB();
         if (!freshData) return;
 
-        const freshClientCertRecordsByKey = new Map(
-          (freshData.clientCertificateRecords || []).map((r) => [r.group_key, r])
-        );
+        const freshClientCertRecords = freshData.clientCertificateRecords || [];
+        const freshClientCertRecordsByKey = new Map(freshClientCertRecords.map((r) => [r.group_key, r]));
+        const existingInternalRefs = new Set(freshClientCertRecords.filter((r) => r.generated_file_path).map((r) => r.internal_reference));
         const groups = collectApprovedClientCertificateGroups(freshData.certs, freshData.invoiceRows).map((group) => {
           const persisted = freshClientCertRecordsByKey.get(group.group_key) || null;
-          return persisted
-            ? { ...group, generated_file_path: persisted.generated_file_path || "" }
+          const alreadyGenerated = persisted?.generated_file_path || existingInternalRefs.has(group.internal_reference);
+          return alreadyGenerated
+            ? { ...group, generated_file_path: persisted?.generated_file_path || "exists" }
             : { ...group, generated_file_path: "" };
         });
 
@@ -4519,6 +4534,16 @@ export default function SAFManager({ onLogout, userEmail }) {
       if (!group) return;
       if (group.generated_file_path) {
         addLog(`Client certificate ${group.internal_reference} already generated.`, "info");
+        return;
+      }
+      // Check DB for existing record with same internal_reference (handles case-sensitivity duplicates)
+      const { data: existingRef } = await supabase
+        .from("client_certificates")
+        .select("id, internal_reference, generated_file_path")
+        .eq("internal_reference", group.internal_reference)
+        .maybeSingle();
+      if (existingRef?.generated_file_path) {
+        addLog(`Client certificate ${group.internal_reference} already exists in database.`, "info");
         return;
       }
       const validationErrors = group.validation_errors || [];
@@ -5001,20 +5026,104 @@ export default function SAFManager({ onLogout, userEmail }) {
                   <div style={{ fontSize: 36, marginBottom: 12 }}>✈</div>
                   <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>Import SAF certificate PDFs to begin</div>
                 </div>
-              ) : (
-                certs.map((cert, index) => (
-                  <CertCard
-                    key={cert.id || index}
-                    cert={cert}
-                    index={index}
-                    selected={selected === index}
-                    onSelect={setSelected}
-                    onAnalyze={analyzeSingle}
-                    onReExtract={reExtractCert}
-                    onOpenPdf={openCertificatePdf}
-                  />
-                ))
-              )}
+              ) : (() => {
+                const certIdsWithClientCert = new Set();
+                clientCertificateGroups.forEach((g) => {
+                  if (g.generated_file_path && g.source_certificate_ids) {
+                    g.source_certificate_ids.forEach((id) => certIdsWithClientCert.add(id));
+                  }
+                });
+
+                const approvedCount = certs.filter((c) => c.match?.status === "approved").length;
+                const autoLinkedCount = certs.filter((c) => c.match?.status === "auto_linked").length;
+                const unmatchedCount = certs.filter((c) => c.match?.status === "unmatched").length;
+                const manualCount = certs.filter((c) => c.match?.status === "manual_only").length;
+                const processedCount = approvedCount + autoLinkedCount;
+                const processedPct = certs.length ? Math.round((processedCount / certs.length) * 100) : 0;
+                const approvedPct = certs.length ? (approvedCount / certs.length) * 100 : 0;
+                const autoLinkedPct = certs.length ? (autoLinkedCount / certs.length) * 100 : 0;
+
+                const statusOrder = { unmatched: 0, auto_linked: 1, manual_only: 2, approved: 3 };
+                const sortedCerts = [...certs].sort((a, b) => {
+                  const sa = statusOrder[a.match?.status] ?? -1;
+                  const sb = statusOrder[b.match?.status] ?? -1;
+                  return sa - sb;
+                });
+
+                const filteredCerts = certStatusFilter
+                  ? sortedCerts.filter((c) => {
+                      if (certStatusFilter === "completed") return c.match?.status === "approved";
+                      return c.match?.status === certStatusFilter;
+                    })
+                  : sortedCerts;
+
+                const filterBtns = [
+                  { key: "", label: "ALL", count: certs.length, color: "#4a7fa0" },
+                  { key: "unmatched", label: "ATTENTION", count: unmatchedCount, color: "#ff6666" },
+                  { key: "auto_linked", label: "TO APPROVE", count: autoLinkedCount, color: "#00bfff" },
+                  { key: "manual_only", label: "MANUAL", count: manualCount, color: "#ffbb00" },
+                  { key: "completed", label: "DONE", count: approvedCount, color: "#00ff9d" },
+                ];
+
+                return (
+                  <>
+                    <div style={{ marginBottom: 10, fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, color: "#4a7fa0" }}>
+                        <span>{processedCount}/{certs.length} processed</span>
+                        <span style={{ color: "#00bfff" }}>{processedPct}%</span>
+                      </div>
+                      <div style={{ height: 6, background: "#0a1628", borderRadius: 3, overflow: "hidden", display: "flex" }}>
+                        <div style={{ width: `${approvedPct}%`, background: "#00ff9d", transition: "width 0.3s" }} />
+                        <div style={{ width: `${autoLinkedPct}%`, background: "#00bfff", transition: "width 0.3s" }} />
+                      </div>
+                      <div style={{ display: "flex", gap: 10, marginTop: 3, fontSize: 9, color: "#4a7fa0" }}>
+                        <span><span style={{ color: "#00ff9d" }}>■</span> Approved</span>
+                        <span><span style={{ color: "#00bfff" }}>■</span> Matched</span>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+                      {filterBtns.map((fb) => (
+                        <button
+                          key={fb.key}
+                          onClick={() => { setCertStatusFilter(fb.key); setSelected(null); }}
+                          style={{
+                            background: certStatusFilter === fb.key ? fb.color + "22" : "#060e1a",
+                            border: `1px solid ${certStatusFilter === fb.key ? fb.color : "#0d2040"}`,
+                            color: certStatusFilter === fb.key ? fb.color : "#4a7fa0",
+                            borderRadius: 4,
+                            padding: "3px 7px",
+                            fontFamily: "'Space Mono', monospace",
+                            fontSize: 9,
+                            cursor: "pointer",
+                            letterSpacing: 0.5,
+                            transition: "all 0.15s",
+                          }}
+                        >
+                          {fb.label} ({fb.count})
+                        </button>
+                      ))}
+                    </div>
+
+                    {filteredCerts.map((cert) => {
+                      const origIndex = certs.indexOf(cert);
+                      return (
+                        <CertCard
+                          key={cert.id || origIndex}
+                          cert={cert}
+                          index={origIndex}
+                          selected={selected === origIndex}
+                          onSelect={setSelected}
+                          onAnalyze={analyzeSingle}
+                          onReExtract={reExtractCert}
+                          onOpenPdf={openCertificatePdf}
+                          hasClientCert={certIdsWithClientCert.has(cert.id)}
+                        />
+                      );
+                    })}
+                  </>
+                );
+              })()}
             </div>
 
             <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
