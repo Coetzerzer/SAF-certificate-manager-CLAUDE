@@ -3115,6 +3115,10 @@ export default function SAFManager({ onLogout, userEmail }) {
   const [pdfPreview, setPdfPreview] = useState(null);
   const [coverageAirportFilter, setCoverageAirportFilter] = useState("");
   const [coverageClientSearch, setCoverageClientSearch] = useState("");
+  const [invoiceStatusFilter, setInvoiceStatusFilter] = useState("");
+  const [invoiceAirportFilter, setInvoiceAirportFilter] = useState("");
+  const [invoiceCustomerSearch, setInvoiceCustomerSearch] = useState("");
+  const [invoiceMonthFilter, setInvoiceMonthFilter] = useState("");
   const pdfInputRef = useRef();
   const csvInputRef = useRef();
   const initialLoadStartedRef = useRef(false);
@@ -5304,48 +5308,100 @@ export default function SAFManager({ onLogout, userEmail }) {
 
         {tab === "db" ? (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+            <style>{`.invoice-row:hover { background: #0a2040 !important; }`}</style>
             {!invoiceRows.length ? (
               <div style={{ textAlign: "center", color: "#4a7fa0", padding: 60 }}>
                 <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
                 <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>Load the 2025 invoice CSV to create row-level matches.</div>
               </div>
-            ) : (
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
-                  <thead>
-                    <tr style={{ borderBottom: "2px solid #0d3060" }}>
-                      {["STATUS", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3"].map(
-                        (header) => (
-                          <th key={header} style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
-                            {header}
-                          </th>
-                        )
-                      )}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {invoiceRows.map((row, index) => (
-                      <tr key={row.id || index} style={{ borderBottom: "1px solid #0d2040", background: index % 2 === 0 ? "#060e1a" : "#030d1a" }}>
-                        <td style={{ padding: "7px 12px" }}>
-                          <Badge status={row.allocation_status || (row.is_allocated ? "allocated" : "free")} />
-                        </td>
-                        <td style={{ padding: "7px 12px", color: "#4a9fd4" }}>{row.row_number}</td>
-                        <td style={{ padding: "7px 12px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.customer || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#888" }}>{row.uplift_date || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.iata || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.icao || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.country || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.supplier || "—"}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.vol_m3)}</td>
-                        <td style={{ padding: "7px 12px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.saf_vol_m3)}</td>
-                        <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.remaining_m3)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            ) : (() => {
+              const searchLower = (invoiceCustomerSearch || "").toLowerCase();
+              const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+              const getRowMonth = (row) => {
+                if (!row.uplift_date) return null;
+                const d = new Date(row.uplift_date);
+                if (isNaN(d)) return null;
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+              };
+              const filteredRows = invoiceRows.filter((row) => {
+                if (invoiceStatusFilter) {
+                  const status = row.allocation_status || (row.is_allocated ? "allocated" : "free");
+                  if (invoiceStatusFilter !== status) return false;
+                }
+                if (invoiceAirportFilter && row.iata !== invoiceAirportFilter) return false;
+                if (invoiceMonthFilter && getRowMonth(row) !== invoiceMonthFilter) return false;
+                if (searchLower && !(row.customer || "").toLowerCase().includes(searchLower) && !(row.invoice_no || "").toLowerCase().includes(searchLower)) return false;
+                return true;
+              });
+              const uniqueAirports = [...new Set(invoiceRows.map((r) => r.iata).filter(Boolean))].sort();
+              const uniqueMonths = [...new Set(invoiceRows.map((r) => getRowMonth(r)).filter(Boolean))].sort();
+              return (
+                <>
+                  <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16, flexWrap: "wrap", fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
+                    <select value={invoiceStatusFilter} onChange={(e) => setInvoiceStatusFilter(e.target.value)}
+                      style={{ background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
+                      <option value="">All statuses</option>
+                      <option value="free">Free</option>
+                      <option value="allocated">Allocated</option>
+                      <option value="partial">Partial</option>
+                    </select>
+                    <select value={invoiceAirportFilter} onChange={(e) => setInvoiceAirportFilter(e.target.value)}
+                      style={{ background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
+                      <option value="">All airports</option>
+                      {uniqueAirports.map((a) => <option key={a} value={a}>{a}</option>)}
+                    </select>
+                    <select value={invoiceMonthFilter} onChange={(e) => setInvoiceMonthFilter(e.target.value)}
+                      style={{ background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
+                      <option value="">All months</option>
+                      {uniqueMonths.map((m) => {
+                        const [y, mo] = m.split("-");
+                        return <option key={m} value={m}>{monthNames[Number(mo) - 1]} {y}</option>;
+                      })}
+                    </select>
+                    <input type="text" placeholder="Search customer or invoice..." value={invoiceCustomerSearch} onChange={(e) => setInvoiceCustomerSearch(e.target.value)}
+                      style={{ background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace", width: 220 }} />
+                    <span style={{ color: "#4a7fa0", marginLeft: "auto" }}>
+                      Showing <span style={{ color: "#00bfff" }}>{filteredRows.length}</span> of <span style={{ color: "#00bfff" }}>{invoiceRows.length}</span> rows
+                    </span>
+                  </div>
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #0d3060" }}>
+                          {["STATUS", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3"].map(
+                            (header) => (
+                              <th key={header} style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
+                                {header}
+                              </th>
+                            )
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredRows.map((row, index) => (
+                          <tr key={row.id || index} className="invoice-row" style={{ borderBottom: "1px solid #0d2040", background: index % 2 === 0 ? "#060e1a" : "#030d1a", transition: "background 0.15s" }}>
+                            <td style={{ padding: "7px 12px" }}>
+                              <Badge status={row.allocation_status || (row.is_allocated ? "allocated" : "free")} />
+                            </td>
+                            <td style={{ padding: "7px 12px", color: "#4a9fd4" }}>{row.row_number}</td>
+                            <td style={{ padding: "7px 12px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.customer || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#888" }}>{row.uplift_date || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.iata || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.icao || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.country || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{row.supplier || "—"}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.vol_m3)}</td>
+                            <td style={{ padding: "7px 12px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.saf_vol_m3)}</td>
+                            <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.remaining_m3)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
           </div>
         ) : null}
 
