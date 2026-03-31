@@ -2828,7 +2828,9 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
       onClick={() => onSelect(index)}
       style={{
         background: selected ? "#0a1628" : "#060e1a",
-        border: selected ? "1px solid #00bfff" : "1px solid #0d2040",
+        borderTop: selected ? "1px solid #00bfff" : "1px solid #0d2040",
+        borderRight: selected ? "1px solid #00bfff" : "1px solid #0d2040",
+        borderBottom: selected ? "1px solid #00bfff" : "1px solid #0d2040",
         borderLeft: `4px solid ${borderLeftColor}`,
         borderRadius: 8,
         padding: "14px 18px",
