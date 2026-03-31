@@ -22,6 +22,7 @@ function toDateOnly(value) {
 function formatMonthLabel(monthKey) {
   if (!/^\d{4}-\d{2}$/.test(String(monthKey ?? ""))) return "";
   const [year, month] = monthKey.split("-").map(Number);
+  if (month < 1 || month > 12) return "";
   const date = new Date(Date.UTC(year, month - 1, 1));
   return date.toLocaleString("en-US", {
     month: "long",

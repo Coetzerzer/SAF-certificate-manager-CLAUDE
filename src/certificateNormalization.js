@@ -219,6 +219,10 @@ function createBaseUnit({
 }
 
 function buildSimpleMonthlyUnits(data, airports, warnings) {
+  if (!airports || !airports.length) {
+    warnings.push("No airports available for simple monthly normalization.");
+    return [];
+  }
   const airportMeta = buildAirportDescriptor(airports[0], "—");
   const monthBounds = makeMonthBounds(data?.coverageMonth || data?.coverageStart || data?.dateDispatch);
   if (!monthBounds.month) warnings.push("Simple monthly normalization could not confirm the covered month.");

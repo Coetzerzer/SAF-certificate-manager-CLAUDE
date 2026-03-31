@@ -8,6 +8,7 @@ import {
   formatClientCertificateMonth,
   formatClientCertificateVolume,
 } from "./src/clientCertificates.js";
+import { buildCoverageData } from "./src/coverageAggregation.js";
 
 const EXTRACTION_FUNCTION = "extract-certificate";
 
@@ -2912,6 +2913,195 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
   );
 }
 
+function formatShortMonth(monthKey) {
+  if (!/^\d{4}-\d{2}$/.test(monthKey)) return monthKey;
+  const [y, m] = monthKey.split("-");
+  const names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  return `${names[Number(m) - 1]} ${y.slice(2)}`;
+}
+
+function CoverageTable({ coverageData, airportFilter, setAirportFilter, clientSearch, setClientSearch }) {
+  const { months, airports, airportMap } = coverageData;
+  const searchLower = (clientSearch || "").toLowerCase();
+
+  const filteredAirports = airportFilter ? airports.filter((a) => a === airportFilter) : airports;
+
+  let grandTotal = 0;
+  const grandMonthTotals = {};
+  for (const m of months) grandMonthTotals[m] = 0;
+
+  const airportSections = filteredAirports.map((airport) => {
+    const clientMap = airportMap.get(airport);
+    if (!clientMap) return null;
+
+    let clients = [...clientMap.entries()].map(([name, monthMap]) => ({ name, monthMap }));
+    if (searchLower) clients = clients.filter((c) => c.name.toLowerCase().includes(searchLower));
+    if (!clients.length) return null;
+
+    clients.sort((a, b) => a.name.localeCompare(b.name));
+
+    const subtotalByMonth = {};
+    for (const m of months) subtotalByMonth[m] = 0;
+    let subtotal = 0;
+
+    const rows = clients.map((client) => {
+      let rowTotal = 0;
+      const cells = months.map((m) => {
+        const cell = client.monthMap.get(m);
+        if (!cell) return { volume: 0, status: "none" };
+        rowTotal += cell.volume;
+        subtotalByMonth[m] += cell.volume;
+        grandMonthTotals[m] += cell.volume;
+        return { volume: cell.volume, status: cell.hasClientCert ? "generated" : "approved" };
+      });
+      subtotal += rowTotal;
+      grandTotal += rowTotal;
+      return { name: client.name, cells, total: rowTotal };
+    });
+
+    return { airport, rows, subtotalByMonth, subtotal };
+  }).filter(Boolean);
+
+  const totalClients = airportSections.reduce((sum, s) => sum + s.rows.length, 0);
+
+  if (!months.length) {
+    return (
+      <div style={{ flex: 1, padding: 60, textAlign: "center", color: "#4a7fa0" }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>📊</div>
+        <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
+          No approved allocations found. Run matching on certificates to populate this view.
+        </div>
+      </div>
+    );
+  }
+
+  const thStyle = {
+    padding: "8px 10px", textAlign: "right", color: "#4a7fa0", fontSize: 9,
+    letterSpacing: 1, fontWeight: 600, position: "sticky", top: 0, background: "#060e1a", zIndex: 2,
+  };
+  const tdStyle = { padding: "6px 10px", textAlign: "right", fontSize: 11, borderBottom: "1px solid #0a1a2e" };
+  const stickyCol = { position: "sticky", left: 0, background: "#060e1a", zIndex: 1 };
+
+  return (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+      <div style={{ display: "flex", gap: 12, padding: "12px 20px", borderBottom: "1px solid #0d2040", alignItems: "center", flexShrink: 0 }}>
+        <select
+          value={airportFilter}
+          onChange={(e) => setAirportFilter(e.target.value)}
+          style={{
+            background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 5,
+            padding: "6px 10px", fontFamily: "'Space Mono', monospace", fontSize: 11,
+          }}
+        >
+          <option value="">All airports ({airports.length})</option>
+          {airports.map((a) => <option key={a} value={a}>{a}</option>)}
+        </select>
+        <input
+          type="text"
+          placeholder="Search client..."
+          value={clientSearch}
+          onChange={(e) => setClientSearch(e.target.value)}
+          style={{
+            background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 5,
+            padding: "6px 10px", fontFamily: "'Space Mono', monospace", fontSize: 11, width: 200,
+          }}
+        />
+        <div style={{ color: "#4a7fa0", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
+          {totalClients} clients · {filteredAirports.length} airports · {months.length} months
+        </div>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 16, fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
+          <span style={{ color: "#4a7fa0" }}>
+            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#00ff9d", marginRight: 4 }} />
+            Client cert generated
+          </span>
+          <span style={{ color: "#4a7fa0" }}>
+            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "#ffa500", marginRight: 4 }} />
+            Approved, not generated
+          </span>
+        </div>
+      </div>
+      <div style={{ flex: 1, overflow: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace" }}>
+          <thead>
+            <tr>
+              <th style={{ ...thStyle, textAlign: "left", minWidth: 200, ...stickyCol, zIndex: 3 }}>CLIENT / AIRPORT</th>
+              {months.map((m) => <th key={m} style={thStyle}>{formatShortMonth(m)}</th>)}
+              <th style={{ ...thStyle, color: "#00bfff" }}>TOTAL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {airportSections.map((section) => (
+              <React.Fragment key={section.airport}>
+                <tr>
+                  <td
+                    colSpan={months.length + 2}
+                    style={{
+                      padding: "10px 10px 6px", fontWeight: 700, fontSize: 12, color: "#00bfff",
+                      borderBottom: "1px solid #0d2040", letterSpacing: 1, ...stickyCol,
+                    }}
+                  >
+                    ✈ {section.airport}
+                  </td>
+                </tr>
+                {section.rows.map((row) => (
+                  <tr key={row.name} style={{ cursor: "default" }} onMouseEnter={(e) => { e.currentTarget.style.background = "#0a1628"; }} onMouseLeave={(e) => { e.currentTarget.style.background = ""; }}>
+                    <td style={{ ...tdStyle, textAlign: "left", color: "#c8dff0", paddingLeft: 20, ...stickyCol }}>
+                      {row.name}
+                    </td>
+                    {row.cells.map((cell, ci) => (
+                      <td key={months[ci]} style={tdStyle}>
+                        {cell.status === "none" ? (
+                          <span style={{ color: "#1a2a3e" }}>—</span>
+                        ) : (
+                          <span style={{ color: cell.status === "generated" ? "#00ff9d" : "#ffa500" }}>
+                            <span style={{
+                              display: "inline-block", width: 6, height: 6, borderRadius: "50%",
+                              background: cell.status === "generated" ? "#00ff9d" : "#ffa500",
+                              marginRight: 4, verticalAlign: "middle",
+                            }} />
+                            {cell.volume.toFixed(3)}
+                          </span>
+                        )}
+                      </td>
+                    ))}
+                    <td style={{ ...tdStyle, color: "#e0f0ff", fontWeight: 600 }}>{row.total.toFixed(3)}</td>
+                  </tr>
+                ))}
+                <tr style={{ borderBottom: "2px solid #0d2040" }}>
+                  <td style={{ ...tdStyle, textAlign: "left", color: "#4a7fa0", fontWeight: 600, paddingLeft: 20, fontSize: 10, ...stickyCol }}>
+                    SUBTOTAL {section.airport}
+                  </td>
+                  {months.map((m) => (
+                    <td key={m} style={{ ...tdStyle, color: "#4a7fa0", fontWeight: 600, fontSize: 10 }}>
+                      {section.subtotalByMonth[m] ? section.subtotalByMonth[m].toFixed(3) : "—"}
+                    </td>
+                  ))}
+                  <td style={{ ...tdStyle, color: "#4a9fd4", fontWeight: 700, fontSize: 10 }}>
+                    {section.subtotal.toFixed(3)}
+                  </td>
+                </tr>
+              </React.Fragment>
+            ))}
+            <tr style={{ background: "#030d1a" }}>
+              <td style={{ padding: "10px 10px", textAlign: "left", fontWeight: 700, color: "#00bfff", fontSize: 11, ...stickyCol, background: "#030d1a" }}>
+                GRAND TOTAL
+              </td>
+              {months.map((m) => (
+                <td key={m} style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: "#00bfff", fontSize: 11 }}>
+                  {grandMonthTotals[m] ? grandMonthTotals[m].toFixed(3) : "—"}
+                </td>
+              ))}
+              <td style={{ padding: "10px 10px", textAlign: "right", fontWeight: 700, color: "#00bfff", fontSize: 12 }}>
+                {grandTotal.toFixed(3)}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 export default function SAFManager({ onLogout, userEmail }) {
   const [certs, setCerts] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -2923,6 +3113,8 @@ export default function SAFManager({ onLogout, userEmail }) {
   const [log, setLog] = useState([]);
   const [expandedCandidates, setExpandedCandidates] = useState({});
   const [pdfPreview, setPdfPreview] = useState(null);
+  const [coverageAirportFilter, setCoverageAirportFilter] = useState("");
+  const [coverageClientSearch, setCoverageClientSearch] = useState("");
   const pdfInputRef = useRef();
   const csvInputRef = useRef();
   const initialLoadStartedRef = useRef(false);
@@ -3478,15 +3670,18 @@ export default function SAFManager({ onLogout, userEmail }) {
       setCerts(hydrated);
       setClientCertificateRecords(clientCertRes.data || []);
       addLog(`Loaded ${hydrated.length} certificate(s) and ${hydratedInvoiceRows.length} invoice row(s)`, "success");
+      return { certs: hydrated, invoiceRows: hydratedInvoiceRows, clientCertificateRecords: clientCertRes.data || [] };
     } catch (error) {
       if (isCurrentRequest()) addLog(`DB reload failed: ${error.message}`, "error");
+      return null;
     }
   }, [addLog, backfillInvoiceRowValidationState, backfillMissingAllocationUnits, backfillMissingSafVolumes]);
 
   useEffect(() => {
     if (initialLoadStartedRef.current) return;
     initialLoadStartedRef.current = true;
-    loadFromDB();
+    setLoading("Loading certificates and invoices...");
+    loadFromDB().finally(() => setLoading(""));
   }, [loadFromDB]);
 
   useEffect(() => {
@@ -3619,6 +3814,10 @@ export default function SAFManager({ onLogout, userEmail }) {
     async (files) => {
       const list = Array.from(files || []);
       if (!list.length) return;
+      if (loading) {
+        addLog("Another operation is in progress. Please wait.", "error");
+        return;
+      }
       setLoading("Extracting certificate data...");
 
       for (const file of list) {
@@ -3695,7 +3894,9 @@ export default function SAFManager({ onLogout, userEmail }) {
           if (saveRes.error) {
             // DB insert/update failed — clean up the orphaned PDF from storage
             if (!storageErr) {
-              await supabase.storage.from("certificates-pdf").remove([storagePath]).catch(() => {});
+              await supabase.storage.from("certificates-pdf").remove([storagePath]).catch((cleanupErr) => {
+                addLog(`Warning: failed to clean up orphaned PDF ${storagePath}: ${cleanupErr.message}`, "error");
+              });
             }
             throw saveRes.error;
           }
@@ -3725,12 +3926,16 @@ export default function SAFManager({ onLogout, userEmail }) {
       await loadFromDB();
       setTab("certs");
     },
-    [addLog, loadFromDB, syncCertificateAllocationUnits]
+    [addLog, loading, loadFromDB, syncCertificateAllocationUnits]
   );
 
   const handleCSVUpload = useCallback(
     async (file) => {
       if (!file) return;
+      if (loading) {
+        addLog("Another operation is in progress. Please wait.", "error");
+        return;
+      }
       setLoading("Importing annual invoice CSV...");
       addLog(`Importing invoice CSV ${file.name}`, "info");
 
@@ -3829,7 +4034,10 @@ export default function SAFManager({ onLogout, userEmail }) {
           .eq("id", stagedImportId);
         if (stagingUpdateErr) throw stagingUpdateErr;
 
+        const totalChunks = Math.ceil(parsed.importRows.length / 500);
         for (let index = 0; index < parsed.importRows.length; index += 500) {
+          const chunkNum = Math.floor(index / 500) + 1;
+          setLoading(`Inserting invoice rows (batch ${chunkNum}/${totalChunks})...`);
           const chunk = parsed.importRows.slice(index, index + 500).map((row) => ({
             import_id: stagedImportId,
             row_number: row.row_number,
@@ -3857,7 +4065,7 @@ export default function SAFManager({ onLogout, userEmail }) {
             );
           }
           const { error: rowsErr } = rowsRes;
-          if (rowsErr) throw rowsErr;
+          if (rowsErr) throw new Error(`Row insertion failed at batch ${chunkNum}/${totalChunks} (rows ${index + 1}-${index + chunk.length}): ${rowsErr.message}`);
         }
 
         const { data: activationResult, error: activationErr } = await supabase.rpc("activate_invoice_import", {
@@ -3882,7 +4090,6 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (activationResult?.previous_active_filename) {
           addLog(`Superseded previous active import ${activationResult.previous_active_filename}`, "info");
         }
-        setLoading("");
         await loadFromDB();
         setTab("db");
       } catch (error) {
@@ -3890,27 +4097,32 @@ export default function SAFManager({ onLogout, userEmail }) {
           const fallbackSummary = {
             filename: file.name,
           };
-          const { error: failErr } = await supabase
-            .from("invoice_imports")
-            .update({
-              status: "failed",
-              failed_at: new Date().toISOString(),
-              validation_summary: {
-                ...fallbackSummary,
-                error_message: error.message,
-              },
-            })
-            .eq("id", stagedImportId)
-            .eq("status", "staging");
-          if (failErr && !isMissingTableError(failErr)) {
-            addLog(`Failed to update staged import status: ${failErr.message}`, "error");
+          try {
+            const { error: failErr } = await supabase
+              .from("invoice_imports")
+              .update({
+                status: "failed",
+                failed_at: new Date().toISOString(),
+                validation_summary: {
+                  ...fallbackSummary,
+                  error_message: error.message,
+                },
+              })
+              .eq("id", stagedImportId)
+              .eq("status", "staging");
+            if (failErr && !isMissingTableError(failErr)) {
+              addLog(`Failed to update staged import status: ${failErr.message}`, "error");
+            }
+          } catch (cleanupErr) {
+            addLog(`Failed to mark import as failed: ${cleanupErr.message}`, "error");
           }
         }
-        setLoading("");
         addLog(`Invoice import failed: ${error.message}`, "error");
+      } finally {
+        setLoading("");
       }
     },
-    [addLog, loadFromDB]
+    [addLog, loading, loadFromDB]
   );
 
   const openStoredPdf = useCallback(
@@ -4065,23 +4277,32 @@ export default function SAFManager({ onLogout, userEmail }) {
     setLoading("Running deterministic allocation...");
     addLog("Running database-side FIFO allocation for all certificates", "info");
 
+    const failures = [];
     try {
       for (let index = 0; index < certs.length; index += 1) {
         const cert = certs[index];
         setLoading(`Matching ${index + 1}/${certs.length}: ${certTitle(cert)}`);
-        const result = await runDatabaseSimpleAllocation(cert);
-        addLog(
-          `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
-          result.status === "unmatched" ? "error" : result.status === "manual_only" ? "info" : "success"
-        );
+        try {
+          const result = await runDatabaseSimpleAllocation(cert);
+          addLog(
+            `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
+            result.status === "unmatched" ? "error" : result.status === "manual_only" ? "info" : "success"
+          );
+        } catch (certErr) {
+          failures.push(certTitle(cert));
+          addLog(`Matching failed for ${certTitle(cert)}: ${certErr.message}`, "error");
+        }
       }
 
-      setLoading("");
+      if (failures.length) {
+        addLog(`Matching completed with ${failures.length} failure(s) out of ${certs.length} certificate(s)`, "error");
+      }
       await loadFromDB();
       setTab("certs");
     } catch (error) {
-      setLoading("");
       addLog(`Full matching run failed: ${error.message}`, "error");
+    } finally {
+      setLoading("");
     }
   }, [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabaseSimpleAllocation]);
 
@@ -4148,6 +4369,137 @@ export default function SAFManager({ onLogout, userEmail }) {
     [addLog, loadFromDB, persistMatch, userEmail]
   );
 
+  const approveAutoLinked = useCallback(
+    async (cert) => {
+      setLoading(`Approving ${certTitle(cert)}...`);
+      try {
+        const { error } = await supabase
+          .from("certificate_matches")
+          .update({
+            status: "approved",
+            reviewed_by: userEmail || null,
+            reviewed_at: new Date().toISOString(),
+            review_note: "Approved auto-linked match.",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("certificate_id", cert.id)
+          .eq("status", "auto_linked");
+        if (error) throw error;
+        addLog(`Approved ${certTitle(cert)}`, "success");
+        await loadFromDB();
+      } catch (err) {
+        addLog(`Approval failed: ${err.message}`, "error");
+      } finally {
+        setLoading("");
+      }
+    },
+    [addLog, loadFromDB, userEmail]
+  );
+
+  const bulkApproveAndGenerate = useCallback(
+    async () => {
+      const autoLinked = certs.filter((c) => c.match?.status === "auto_linked");
+      if (!autoLinked.length) {
+        addLog("No auto-linked certificates to approve.", "info");
+        return;
+      }
+
+      if (loading) {
+        addLog("Another operation is in progress. Please wait.", "error");
+        return;
+      }
+
+      setLoading(`Approving ${autoLinked.length} certificates...`);
+      try {
+        const ids = autoLinked.map((c) => c.id);
+        const { error } = await supabase
+          .from("certificate_matches")
+          .update({
+            status: "approved",
+            reviewed_by: userEmail || null,
+            reviewed_at: new Date().toISOString(),
+            review_note: "Bulk approved auto-linked match.",
+            updated_at: new Date().toISOString(),
+          })
+          .in("certificate_id", ids)
+          .eq("status", "auto_linked");
+        if (error) throw error;
+        addLog(`Approved ${autoLinked.length} auto-linked certificates`, "success");
+
+        const freshData = await loadFromDB();
+        if (!freshData) return;
+
+        const freshClientCertRecordsByKey = new Map(
+          (freshData.clientCertificateRecords || []).map((r) => [r.group_key, r])
+        );
+        const groups = collectApprovedClientCertificateGroups(freshData.certs, freshData.invoiceRows).map((group) => {
+          const persisted = freshClientCertRecordsByKey.get(group.group_key) || null;
+          return persisted
+            ? { ...group, generated_file_path: persisted.generated_file_path || "" }
+            : { ...group, generated_file_path: "" };
+        });
+
+        const toGenerate = groups.filter((g) => g.can_generate && !g.generated_file_path);
+        if (!toGenerate.length) {
+          addLog("All client certificates already generated or no valid groups to generate.", "info");
+          return;
+        }
+
+        const { generateClientCertificatePdf } = await import("./src/clientCertificatePdf.js");
+        let generated = 0;
+        let failures = 0;
+        for (let i = 0; i < toGenerate.length; i++) {
+          const group = toGenerate[i];
+          setLoading(`Generating client cert ${i + 1}/${toGenerate.length}: ${group.internal_reference}`);
+          try {
+            const pdfBytes = await generateClientCertificatePdf(group);
+            const filePath = `generated/${Date.now()}-${group.internal_reference}.pdf`;
+            const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+            const { error: uploadErr } = await supabase.storage
+              .from("client-certificates-pdf")
+              .upload(filePath, pdfBlob, { contentType: "application/pdf", upsert: false });
+            if (uploadErr) throw uploadErr;
+
+            const payload = {
+              group_key: group.group_key,
+              client_name: group.client_name,
+              airport_code: group.airport_code,
+              month: group.month,
+              total_saf_volume_m3: group.total_saf_volume_m3,
+              source_certificate_refs: group.source_certificate_refs,
+              source_certificate_ids: group.source_certificate_ids,
+              source_invoice_row_ids: group.source_invoice_row_ids,
+              source_link_ids: group.source_link_ids,
+              approved_link_count: group.approved_link_count,
+              matched_row_count: group.matched_row_count,
+              issue_date: group.issue_date,
+              internal_reference: group.internal_reference,
+              generated_file_path: filePath,
+              updated_at: new Date().toISOString(),
+            };
+            const { error: saveErr } = await supabase.from("client_certificates").upsert(payload, { onConflict: "group_key" });
+            if (saveErr) throw saveErr;
+            generated++;
+          } catch (genErr) {
+            failures++;
+            addLog(`Failed to generate ${group.internal_reference}: ${genErr.message}`, "error");
+          }
+        }
+
+        addLog(
+          `Client certificates: ${generated} generated` + (failures ? `, ${failures} failed` : ""),
+          failures ? "error" : "success"
+        );
+        await loadFromDB();
+      } catch (err) {
+        addLog(`Bulk approval failed: ${err.message}`, "error");
+      } finally {
+        setLoading("");
+      }
+    },
+    [certs, addLog, loading, loadFromDB, userEmail]
+  );
+
   const openClientCertificatePdf = useCallback(
     async (group) =>
       openStoredPdf({
@@ -4161,6 +4513,10 @@ export default function SAFManager({ onLogout, userEmail }) {
   const generateClientCertificate = useCallback(
     async (group) => {
       if (!group) return;
+      if (group.generated_file_path) {
+        addLog(`Client certificate ${group.internal_reference} already generated.`, "info");
+        return;
+      }
       const validationErrors = group.validation_errors || [];
       if (validationErrors.length) {
         addLog(`Client certificate generation blocked: ${validationErrors.join(" | ")}`, "error");
@@ -4238,7 +4594,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     allocatedRows: invoiceRows.filter((row) => row.allocation_status === "allocated" || row.allocation_status === "partial").length,
   };
   const clientCertificateRecordsByKey = new Map((clientCertificateRecords || []).map((row) => [row.group_key, row]));
-  const clientCertificateGroups = collectApprovedClientCertificateGroups(certs, invoiceRows).map((group) => {
+  const liveGroups = collectApprovedClientCertificateGroups(certs, invoiceRows).map((group) => {
     const persisted = clientCertificateRecordsByKey.get(group.group_key) || null;
     return persisted
       ? {
@@ -4257,6 +4613,40 @@ export default function SAFManager({ onLogout, userEmail }) {
           persisted_id: null,
         };
   });
+
+  const liveGroupKeys = new Set(liveGroups.map((g) => g.group_key));
+  const persistedOnlyGroups = (clientCertificateRecords || [])
+    .filter((r) => r.generated_file_path && !liveGroupKeys.has(r.group_key))
+    .map((r) => ({
+      group_key: r.group_key,
+      client_name: r.client_name || "",
+      airport_code: r.airport_code || "",
+      month: r.month || "",
+      month_label: formatClientCertificateMonth(r.month),
+      issue_date: r.issue_date || "",
+      issue_date_display: formatClientCertificateDate(r.issue_date),
+      internal_reference: r.internal_reference || "",
+      total_saf_volume_m3: Number(r.total_saf_volume_m3 || 0),
+      source_certificate_refs: r.source_certificate_refs || [],
+      source_certificate_ids: r.source_certificate_ids || [],
+      source_invoice_row_ids: r.source_invoice_row_ids || [],
+      source_link_ids: r.source_link_ids || [],
+      approved_link_count: r.approved_link_count || 0,
+      matched_row_count: r.matched_row_count || 0,
+      validation_errors: [],
+      can_generate: false,
+      generated_file_path: r.generated_file_path || "",
+      created_at: r.created_at || null,
+      persisted_id: r.id,
+    }));
+
+  const clientCertificateGroups = [...liveGroups, ...persistedOnlyGroups].sort((a, b) =>
+    (a.client_name || "").localeCompare(b.client_name || "") ||
+    (a.airport_code || "").localeCompare(b.airport_code || "") ||
+    (a.month || "").localeCompare(b.month || "")
+  );
+
+  const coverageData = buildCoverageData(certs, clientCertificateRecords);
 
   return (
     <div
@@ -4520,24 +4910,42 @@ export default function SAFManager({ onLogout, userEmail }) {
 
         <div style={{ flex: 1 }} />
 
-        {certs.length ? (
-          <>
-            <button
-              className="btn"
-              onClick={analyzeAll}
-              style={{
-                background: "linear-gradient(135deg,#0050aa,#00bfff)",
-                color: "#fff",
-                padding: "7px 18px",
-                borderRadius: 6,
-                fontFamily: "'Space Mono', monospace",
-                fontSize: 11,
-                letterSpacing: 1,
-              }}
-            >
-              MATCH ALL
-            </button>
-          </>
+        <button
+          className="btn"
+          onClick={analyzeAll}
+          disabled={!certs.length || !!loading}
+          style={{
+            background: !certs.length || loading ? "#0a1628" : "linear-gradient(135deg,#0050aa,#00bfff)",
+            color: !certs.length || loading ? "#4a7fa0" : "#fff",
+            padding: "7px 18px",
+            borderRadius: 6,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 11,
+            letterSpacing: 1,
+            border: !certs.length || loading ? "1px solid #0d3060" : "none",
+          }}
+        >
+          MATCH ALL
+        </button>
+        {certs.some((c) => c.match?.status === "auto_linked") ? (
+          <button
+            className="btn"
+            onClick={bulkApproveAndGenerate}
+            disabled={!!loading}
+            style={{
+              background: loading ? "#0a1628" : "linear-gradient(135deg,#006030,#00ff9d)",
+              color: loading ? "#4a7fa0" : "#001a0d",
+              padding: "7px 18px",
+              borderRadius: 6,
+              fontFamily: "'Space Mono', monospace",
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: 1,
+              border: loading ? "1px solid #0d3060" : "none",
+            }}
+          >
+            APPROVE ALL ({certs.filter((c) => c.match?.status === "auto_linked").length})
+          </button>
         ) : null}
       </div>
 
@@ -4561,6 +4969,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         {[
           ["certs", "CERTIFICATES"],
           ["clientCerts", "CLIENT CERTIFICATES"],
+          ["coverage", "COVERAGE"],
           ["db", "INVOICE ROWS"],
           ["log", "LOG"],
         ].map(([key, label]) => (
@@ -4731,6 +5140,58 @@ export default function SAFManager({ onLogout, userEmail }) {
                       <MatchRowsTable rows={selectedCert.match?.links || []} title="LINKED INVOICE ROWS" />
                     </div>
 
+                    {selectedCert.match?.status === "auto_linked" ? (
+                      <div
+                        style={{
+                          gridColumn: "1 / -1",
+                          display: "flex",
+                          gap: 12,
+                          alignItems: "center",
+                          padding: "12px 0",
+                        }}
+                      >
+                        <button
+                          className="btn"
+                          onClick={() => approveAutoLinked(selectedCert)}
+                          disabled={!!loading}
+                          style={{
+                            background: "#003322",
+                            color: "#00ff9d",
+                            padding: "8px 20px",
+                            borderRadius: 6,
+                            fontFamily: "'Space Mono', monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: 1,
+                            border: "1px solid #00ff9d44",
+                          }}
+                        >
+                          APPROVE
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => rejectMatch(selectedCert)}
+                          disabled={!!loading}
+                          style={{
+                            background: "#1a0000",
+                            color: "#ff6666",
+                            padding: "8px 20px",
+                            borderRadius: 6,
+                            fontFamily: "'Space Mono', monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: 1,
+                            border: "1px solid #ff666644",
+                          }}
+                        >
+                          REJECT
+                        </button>
+                        <span style={{ color: "#4a7fa0", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
+                          This certificate was auto-linked by the FIFO algorithm. Approve to enable client certificate generation.
+                        </span>
+                      </div>
+                    ) : null}
+
                     {(selectedCert.match?.candidate_sets || []).length ? (
                       <div
                         style={{
@@ -4888,6 +5349,16 @@ export default function SAFManager({ onLogout, userEmail }) {
           </div>
         ) : null}
 
+        {tab === "coverage" ? (
+          <CoverageTable
+            coverageData={coverageData}
+            airportFilter={coverageAirportFilter}
+            setAirportFilter={setCoverageAirportFilter}
+            clientSearch={coverageClientSearch}
+            setClientSearch={setCoverageClientSearch}
+          />
+        ) : null}
+
         {tab === "clientCerts" ? (
           <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
             {!clientCertificateGroups.length ? (
@@ -4940,20 +5411,28 @@ export default function SAFManager({ onLogout, userEmail }) {
                         <button
                           className="btn"
                           onClick={() => generateClientCertificate(group)}
-                          disabled={!group.can_generate}
+                          disabled={!group.can_generate || !!group.generated_file_path}
                           style={{
-                            background: group.can_generate ? "linear-gradient(135deg,#0050aa,#00bfff)" : "#0a1628",
-                            color: group.can_generate ? "#fff" : "#4a7fa0",
+                            background: group.generated_file_path
+                              ? "#001a0d"
+                              : group.can_generate
+                                ? "linear-gradient(135deg,#0050aa,#00bfff)"
+                                : "#0a1628",
+                            color: group.generated_file_path ? "#00ff9d" : group.can_generate ? "#fff" : "#4a7fa0",
                             padding: "7px 14px",
                             borderRadius: 6,
                             fontFamily: "'Space Mono', monospace",
                             fontSize: 11,
                             letterSpacing: 1,
-                            border: group.can_generate ? "none" : "1px solid #0d3060",
-                            opacity: group.can_generate ? 1 : 0.7,
+                            border: group.generated_file_path
+                              ? "1px solid #00ff9d44"
+                              : group.can_generate
+                                ? "none"
+                                : "1px solid #0d3060",
+                            opacity: group.can_generate || group.generated_file_path ? 1 : 0.7,
                           }}
                         >
-                          GENERATE PDF
+                          {group.generated_file_path ? "GENERATED" : "GENERATE PDF"}
                         </button>
                         {group.generated_file_path ? (
                           <button

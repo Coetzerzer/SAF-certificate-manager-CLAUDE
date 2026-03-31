@@ -146,21 +146,38 @@ function parseFlexibleNumber(value) {
 
 function getCertKind(data) {
   const docType = String(data?.docType || "").toLowerCase();
-  if (docType.includes("poc") || docType.includes("proof of compliance")) return "poc";
-  if (docType.includes("pos") || docType.includes("proof of sustainability")) return "pos";
+  if (/\bpoc\b/.test(docType) || docType.includes("proof of compliance")) return "poc";
+  if (/\bpos\b/.test(docType) || docType.includes("proof of sustainability")) return "pos";
   return "unknown";
+}
+
+function isNonM3Unit(unitStr) {
+  if (!unitStr) return false;
+  const u = String(unitStr).toLowerCase().replace(/[^a-z0-9/°³]/g, "");
+  if (/^m3|^m³|^m3\/15|^m³\/15/.test(u)) return false;
+  if (/litr|^l$|^lt$|gallon|^gal$|barrel|^bbl$|^mt$|tonne|^kg$|^ton$/.test(u)) return true;
+  return false;
 }
 
 function normalizeAirportCode(value) {
   return String(value ?? "").trim().toUpperCase();
 }
 
+function isValidAirportCode(code, type) {
+  if (!code) return false;
+  if (type === "iata") return /^[A-Z]{3}$/.test(code);
+  if (type === "icao") return /^[A-Z]{4}$/.test(code);
+  return false;
+}
+
 function normalizeAirportEntry(entry) {
   if (!entry) return null;
-  const iata = normalizeAirportCode(entry.iata);
-  const icao = normalizeAirportCode(entry.icao);
+  const rawIata = normalizeAirportCode(entry.iata);
+  const rawIcao = normalizeAirportCode(entry.icao);
+  const iata = isValidAirportCode(rawIata, "iata") ? rawIata : "";
+  const icao = isValidAirportCode(rawIcao, "icao") ? rawIcao : "";
   const raw = String(entry.raw || "").trim();
-  const label = String(entry.label || entry.raw || iata || icao || "").trim();
+  const label = String(entry.label || entry.raw || rawIata || rawIcao || "").trim();
   if (!iata && !icao && !raw && !label) return null;
   return { raw, label, iata, icao };
 }
@@ -474,6 +491,7 @@ export function deriveCertificateClassification(data, context = {}) {
   if (airportCount !== 1) rejectionReasons.push(airportCount ? "certificate covers multiple airports" : "certificate airport is unclear");
   if (coverage.isAmbiguous) rejectionReasons.push(coverage.ambiguityReason);
   if (!Number.isFinite(quantity) || quantity <= 0) rejectionReasons.push("certificate SAF volume is unclear");
+  if (isNonM3Unit(data?.quantityUnit)) rejectionReasons.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
   if (hasMonthlyTable || hasAirportTable) rejectionReasons.push("complex tables are present");
   if (underlyingPoSCount > 1) rejectionReasons.push("multiple underlying certificates are present");
   if (annualTextHint) rejectionReasons.push("annual coverage was detected");

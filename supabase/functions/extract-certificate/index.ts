@@ -247,6 +247,15 @@ Deno.serve(async (req) => {
     const clean = outputText.replace(/```json|```/g, "").trim();
     const parsed = normalizeCommaDecimals(JSON.parse(clean));
 
+    // Validate critical fields exist
+    const missingFields: string[] = [];
+    if (!parsed.docType) missingFields.push("docType");
+    if (!parsed.uniqueNumber) missingFields.push("uniqueNumber");
+    if (parsed.quantity === undefined || parsed.quantity === null || parsed.quantity === "") missingFields.push("quantity");
+    if (missingFields.length) {
+      parsed._extractionWarnings = `Missing critical fields: ${missingFields.join(", ")}`;
+    }
+
     return jsonResponse({
       parsed,
       model: payload.model || OPENAI_MODEL,
