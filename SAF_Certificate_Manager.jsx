@@ -1511,6 +1511,26 @@ function parseInvoiceCSV(text) {
   };
 }
 
+function deriveInvoiceYear(parsedCSV) {
+  const yearCounts = new Map();
+  for (const row of parsedCSV.importRows || []) {
+    const date = parseDateValue(row.uplift_date);
+    if (!date) continue;
+    const year = date.getUTCFullYear();
+    yearCounts.set(year, (yearCounts.get(year) || 0) + 1);
+  }
+  if (!yearCounts.size) return new Date().getUTCFullYear();
+  let bestYear = 0;
+  let bestCount = 0;
+  for (const [year, count] of yearCounts) {
+    if (count > bestCount) {
+      bestYear = year;
+      bestCount = count;
+    }
+  }
+  return bestYear;
+}
+
 function normalizeCommaDecimals(parsed) {
   const fix = (value) => {
     if (typeof value !== "string") return value;
@@ -2598,6 +2618,19 @@ async function backfillCanonicalCertificateRows(certRows) {
   let updatedCount = 0;
 
   for (const row of certRows || []) {
+    // Skip backfill for certs that already have canonical airports and classification columns populated.
+    // This avoids 228 sequential PATCH requests on every page load.
+    const alreadyClassified =
+      Array.isArray(row.data?.canonicalAirports) &&
+      row.data.canonicalAirports.length > 0 &&
+      row.document_family &&
+      row.matching_mode;
+
+    if (alreadyClassified) {
+      normalizedRows.push(row);
+      continue;
+    }
+
     const normalized = normalizeCertificateAirports(row.data || {}, { filename: row.filename });
     normalizedRows.push({
       ...row,
@@ -3606,13 +3639,23 @@ export default function SAFManager({ onLogout, userEmail }) {
               saveRes = await supabase.from("certificates").insert(baseCertificatePayload).select("id").single();
             }
           }
-          if (saveRes.error) throw saveRes.error;
-          await syncCertificateAllocationUnits({
-            id: saveRes.data?.id,
-            filename: file.name,
-            data: parsed,
-            ...classification,
-          });
+          if (saveRes.error) {
+            // DB insert/update failed — clean up the orphaned PDF from storage
+            if (!storageErr) {
+              await supabase.storage.from("certificates-pdf").remove([storagePath]).catch(() => {});
+            }
+            throw saveRes.error;
+          }
+          try {
+            await syncCertificateAllocationUnits({
+              id: saveRes.data?.id,
+              filename: file.name,
+              data: parsed,
+              ...classification,
+            });
+          } catch (unitErr) {
+            addLog(`Allocation unit sync warning for ${file.name}: ${unitErr.message}`, "error");
+          }
           addLog(`Saved ${certTitle({ filename: file.name, data: parsed })}`, "success");
           if (extraction.usage) {
             addLog(
@@ -3658,6 +3701,7 @@ export default function SAFManager({ onLogout, userEmail }) {
           missing_headers: missingRequiredHeaders,
         };
 
+        const invoiceYear = deriveInvoiceYear(parsed);
         const storagePath = `invoices/${Date.now()}-${file.name}`;
         const { error: storageErr } = await supabase.storage
           .from("invoices-csv")
@@ -3669,7 +3713,7 @@ export default function SAFManager({ onLogout, userEmail }) {
           .insert({
             filename: file.name,
             storage_path: storagePath,
-            year: 2025,
+            year: invoiceYear,
             status: "staging",
             row_count: 0,
             candidate_row_count: 0,

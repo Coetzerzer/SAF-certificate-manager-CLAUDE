@@ -99,15 +99,41 @@ begin
       failed_at = null
   where id = p_import_id;
 
-  delete from public.certificate_matches;
+  -- Only delete matches for certificates whose coverage year matches this import's year.
+  -- This preserves approved matches for other years when re-importing a single year's CSV.
+  delete from public.certificate_matches
+  where certificate_id in (
+    select c.id
+    from public.certificates c
+    where extract(year from to_date(
+      nullif(coalesce(c.data->>'coverageMonth', ''), '') || '-01',
+      'YYYY-MM-DD'
+    )) = v_target.year
+  )
+  or certificate_id in (
+    -- Also clear matches for certificates with no coverage month (they need re-evaluation)
+    select c.id
+    from public.certificates c
+    where coalesce(c.data->>'coverageMonth', '') = ''
+  );
 
+  -- Only reset allocation units for the same scoped certificates.
   update public.certificate_allocation_units
   set consumed_volume_m3 = 0,
       remaining_volume_m3 = case
         when saf_volume_m3 is null then null
         else greatest(0, saf_volume_m3)
       end,
-      updated_at = now();
+      updated_at = now()
+  where certificate_id in (
+    select c.id
+    from public.certificates c
+    where coalesce(c.data->>'coverageMonth', '') = ''
+       or extract(year from to_date(
+            nullif(coalesce(c.data->>'coverageMonth', ''), '') || '-01',
+            'YYYY-MM-DD'
+          )) = v_target.year
+  );
 
   return jsonb_build_object(
     'activated_import_id', p_import_id,
