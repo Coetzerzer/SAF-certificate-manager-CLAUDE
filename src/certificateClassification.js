@@ -479,8 +479,14 @@ export function deriveCertificateClassification(data, context = {}) {
   const airportCount = airportCodes.length;
   const coverage = deriveSimpleMonthCoverage(data, context);
   const quantity = parseFlexibleNumber(data?.quantity);
-  const hasMonthlyTable = Boolean((data?.monthlyVolumes || []).length);
-  const hasAirportTable = Boolean((data?.airportVolumes || []).length);
+  const monthlyVolumeAirports = new Set(
+    (data?.monthlyVolumes || []).map((item) => getAirportIdentityKey(item?.airportCanonical)).filter(Boolean)
+  );
+  const airportVolumeAirports = new Set(
+    (data?.airportVolumes || []).map((item) => getAirportIdentityKey(item?.airportCanonical)).filter(Boolean)
+  );
+  const hasComplexMonthlyTable = monthlyVolumeAirports.size > 1;
+  const hasComplexAirportTable = airportVolumeAirports.size > 1;
   const underlyingPoSCount = countUnderlyingPoS(data);
   const additionalTexts = getCertificateAdditionalInfoTexts(data).join(" ");
   const annualTextHint = /\b(annual|calendar year|full year|yearly)\b/i.test(additionalTexts);
@@ -491,8 +497,9 @@ export function deriveCertificateClassification(data, context = {}) {
   if (airportCount !== 1) rejectionReasons.push(airportCount ? "certificate covers multiple airports" : "certificate airport is unclear");
   if (coverage.isAmbiguous) rejectionReasons.push(coverage.ambiguityReason);
   if (!Number.isFinite(quantity) || quantity <= 0) rejectionReasons.push("certificate SAF volume is unclear");
+  else if (quantity > 50) rejectionReasons.push(`SAF volume ${quantity} m³ exceeds plausibility threshold — likely a number format error`);
   if (isNonM3Unit(data?.quantityUnit)) rejectionReasons.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
-  if (hasMonthlyTable || hasAirportTable) rejectionReasons.push("complex tables are present");
+  if (hasComplexMonthlyTable || hasComplexAirportTable) rejectionReasons.push("complex tables are present");
   if (underlyingPoSCount > 1) rejectionReasons.push("multiple underlying certificates are present");
   if (annualTextHint) rejectionReasons.push("annual coverage was detected");
 

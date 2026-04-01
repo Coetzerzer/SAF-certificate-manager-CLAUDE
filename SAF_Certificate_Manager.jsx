@@ -110,7 +110,7 @@ const CANONICAL_AIRPORTS = [
     iata: "GRO",
     icao: "LEGE",
     label: "Girona",
-    aliases: ["Aeropuerto de Girona", "Girona Airport", "Girona"],
+    aliases: ["Aeropuerto de Girona", "Girona Airport", "Girona", "Girona Costa Brava", "Aeropuerto de Girona Costa Brava", "Gerona", "Gerona Airport", "Aeropuerto de Gerona"],
   },
   {
     iata: "GRX",
@@ -134,7 +134,7 @@ const CANONICAL_AIRPORTS = [
     iata: "MAD",
     icao: "LEMD",
     label: "Madrid",
-    aliases: ["Madrid", "Madrid Airport", "Adolfo Suarez Madrid Barajas", "Barajas"],
+    aliases: ["Madrid", "Madrid Airport", "Adolfo Suarez Madrid Barajas", "Barajas", "Madrid-Barajas", "Madrid Barajas"],
   },
   {
     iata: "MJV",
@@ -176,13 +176,13 @@ const CANONICAL_AIRPORTS = [
     iata: "SDR",
     icao: "LEXJ",
     label: "Santander",
-    aliases: ["Santander", "Santander Airport", "Aeropuerto de Santander"],
+    aliases: ["Santander", "Santander Airport", "Aeropuerto de Santander", "Santader", "Aeropuerto de Santader"],
   },
   {
     iata: "SVQ",
     icao: "LEZL",
     label: "Seville",
-    aliases: ["Seville", "Seville Airport", "Sevilla", "Aeropuerto de Sevilla"],
+    aliases: ["Seville", "Seville Airport", "Sevilla", "Aeropuerto de Sevilla", "San Pablo", "Aeropuerto de San Pablo", "Aeropuerto de San Pablo Sevilla"],
   },
   {
     iata: "VGO",
@@ -2619,13 +2619,14 @@ async function backfillCanonicalCertificateRows(certRows) {
   let updatedCount = 0;
 
   for (const row of certRows || []) {
-    // Skip backfill for certs that already have canonical airports and classification columns populated.
-    // This avoids 228 sequential PATCH requests on every page load.
+    // Skip backfill for certs that already have canonical airports and classification columns populated,
+    // UNLESS they are manual_only (re-check in case alias updates fix their classification).
     const alreadyClassified =
       Array.isArray(row.data?.canonicalAirports) &&
       row.data.canonicalAirports.length > 0 &&
       row.document_family &&
-      row.matching_mode;
+      row.matching_mode &&
+      row.document_family !== "manual_only";
 
     if (alreadyClassified) {
       normalizedRows.push(row);
@@ -2702,6 +2703,7 @@ function Badge({ status }) {
     manual_only: ["#ffbb00", "#1a1200"],
     simple_monthly_airport: ["#4a9fd4", "#061423"],
     auto_linked: ["#00ff9d", "#001a0d"],
+    partial_linked: ["#ff9933", "#1a0d00"],
     approved: ["#00ff9d", "#001a0d"],
     needs_review: ["#ffbb00", "#1a1200"],
     unmatched: ["#ff6666", "#1a0000"],
@@ -2821,6 +2823,7 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
     isCompleted ? "#00ff9d" :
     status === "approved" ? "#00cc7a" :
     status === "auto_linked" ? "#00bfff" :
+    status === "partial_linked" ? "#ff9933" :
     status === "unmatched" ? "#ff6666" :
     status === "manual_only" ? "#ffbb00" : "#334";
   return (
@@ -2871,6 +2874,7 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
           )}
           <div style={{ color: "#4a7fa0", fontSize: 11, marginTop: 3 }}>
             {formatVolume(cert.data?.quantity)} {cert.data?.quantityUnit || "m3"}
+            {Number(cert.data?.quantity) > 50 ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Volume exceeds plausibility threshold — likely a number format error">⚠ VOLUME?</span> : null}
           </div>
           <div style={{ color: "#4a7fa0", fontSize: 10, marginTop: 3 }}>
             {cert.support_reason || cert.data?.support_reason || "Not processed yet"}
@@ -3124,6 +3128,7 @@ export default function SAFManager({ onLogout, userEmail }) {
   const [invoiceRows, setInvoiceRows] = useState([]);
   const [invoiceImport, setInvoiceImport] = useState(null);
   const [clientCertificateRecords, setClientCertificateRecords] = useState([]);
+  const [companiesByName, setCompaniesByName] = useState(new Map());
   const [loading, setLoading] = useState("");
   const [tab, setTab] = useState("certs");
   const [log, setLog] = useState([]);
@@ -3466,7 +3471,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (isCurrentRequest()) addLog(`Canonical airport backfill warning: ${error.message}`, "error");
       }
 
-      const [importRes, fallbackImportRes, legacyImportRes, matchRes, linkRes, unitRes, clientCertRes] = await Promise.all([
+      const [importRes, fallbackImportRes, legacyImportRes, matchRes, linkRes, unitRes, clientCertRes, companiesRes] = await Promise.all([
         supabase.from("invoice_imports").select("*").eq("status", "active").order("activated_at", { ascending: false }).order("created_at", { ascending: false }).limit(1),
         supabase
           .from("invoice_imports")
@@ -3480,6 +3485,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         supabase.from("certificate_invoice_links").select("*"),
         supabase.from("certificate_allocation_units").select("*").order("unit_index", { ascending: true }),
         supabase.from("client_certificates").select("*").order("created_at", { ascending: false }),
+        supabase.from("companies").select("name, street, street_no, zip, city, country"),
       ]);
 
       if (importRes.error && !isMissingTableError(importRes.error) && isCurrentRequest()) addLog(`Invoice import error: ${importRes.error.message}`, "error");
@@ -3495,6 +3501,11 @@ export default function SAFManager({ onLogout, userEmail }) {
       if (clientCertRes.error && !isMissingTableError(clientCertRes.error) && isCurrentRequest()) {
         addLog(`Client certificates DB error: ${clientCertRes.error.message}`, "error");
       }
+      if (companiesRes.error && !isMissingTableError(companiesRes.error) && isCurrentRequest()) {
+        addLog(`Companies DB error: ${companiesRes.error.message}`, "error");
+      }
+
+      const companiesByName = new Map((companiesRes.data || []).map((c) => [c.name.toLowerCase(), c]));
 
       const latestImport = importRes.data?.[0] || fallbackImportRes.data?.[0] || null;
 
@@ -3524,7 +3535,10 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (latestImport.storage_path) {
           try {
             const { data: csvBlob, error: downloadErr } = await supabase.storage.from("invoices-csv").download(latestImport.storage_path);
-            if (downloadErr) throw downloadErr;
+            if (downloadErr) {
+              // Storage file may be missing/renamed — not critical if invoice rows already exist in DB
+              if (!invoiceRowsData.length) throw downloadErr;
+            } else {
             const text = await csvBlob.text();
             const parsed = parseInvoiceCSV(text);
             const expectedRows = parsed.importRows || [];
@@ -3574,8 +3588,12 @@ export default function SAFManager({ onLogout, userEmail }) {
               invoiceRowsData = refetched.data || [];
               if (isCurrentRequest()) addLog(`Backfilled ${missingRows.length} missing invoice row(s) from ${latestImport.filename}`, "info");
             }
+            }
           } catch (error) {
-            if (isCurrentRequest()) addLog(`Invoice row backfill warning: ${error.message}`, "error");
+            if (isCurrentRequest()) {
+              const msg = error instanceof Error ? error.message : (error?.message || error?.error || error?.statusText || (typeof error === "string" ? error : JSON.stringify(error)));
+              addLog(`Invoice row backfill warning: ${msg}`, "error");
+            }
           }
         }
 
@@ -3689,8 +3707,9 @@ export default function SAFManager({ onLogout, userEmail }) {
       setInvoiceRows(hydratedInvoiceRows);
       setCerts(hydrated);
       setClientCertificateRecords(clientCertRes.data || []);
+      setCompaniesByName(companiesByName);
       addLog(`Loaded ${hydrated.length} certificate(s) and ${hydratedInvoiceRows.length} invoice row(s)`, "success");
-      return { certs: hydrated, invoiceRows: hydratedInvoiceRows, clientCertificateRecords: clientCertRes.data || [] };
+      return { certs: hydrated, invoiceRows: hydratedInvoiceRows, clientCertificateRecords: clientCertRes.data || [], companiesByName };
     } catch (error) {
       if (isCurrentRequest()) addLog(`DB reload failed: ${error.message}`, "error");
       return null;
@@ -3886,16 +3905,19 @@ export default function SAFManager({ onLogout, userEmail }) {
                 .single();
             }
             if (saveRes.error?.code === "23505") {
+              // Duplicate cert — update data but preserve existing pdf_path to avoid storage mismatch
+              const { pdf_path: _drop, ...extendedWithoutPath } = extendedCertificatePayload;
+              const { pdf_path: _drop2, ...baseWithoutPath } = baseCertificatePayload;
               saveRes = await supabase
                 .from("certificates")
-                .update(extendedCertificatePayload)
+                .update(extendedWithoutPath)
                 .eq("unique_number", uniqueNumber)
                 .select("id")
                 .single();
               if (saveRes.error && isMissingColumnError(saveRes.error)) {
                 saveRes = await supabase
                   .from("certificates")
-                  .update(baseCertificatePayload)
+                  .update(baseWithoutPath)
                   .eq("unique_number", uniqueNumber)
                   .select("id")
                   .single();
@@ -4301,12 +4323,13 @@ export default function SAFManager({ onLogout, userEmail }) {
     try {
       for (let index = 0; index < certs.length; index += 1) {
         const cert = certs[index];
+        if (cert.match?.status === "approved") continue;
         setLoading(`Matching ${index + 1}/${certs.length}: ${certTitle(cert)}`);
         try {
           const result = await runDatabaseSimpleAllocation(cert);
           addLog(
             `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
-            result.status === "unmatched" ? "error" : result.status === "manual_only" ? "info" : "success"
+            result.status === "unmatched" ? "error" : result.status === "manual_only" || result.status === "partial_linked" ? "info" : "success"
           );
         } catch (certErr) {
           failures.push(certTitle(cert));
@@ -4452,7 +4475,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         const freshClientCertRecords = freshData.clientCertificateRecords || [];
         const freshClientCertRecordsByKey = new Map(freshClientCertRecords.map((r) => [r.group_key, r]));
         const existingInternalRefs = new Set(freshClientCertRecords.filter((r) => r.generated_file_path).map((r) => r.internal_reference));
-        const groups = collectApprovedClientCertificateGroups(freshData.certs, freshData.invoiceRows).map((group) => {
+        const groups = collectApprovedClientCertificateGroups(freshData.certs, freshData.invoiceRows, new Date(), freshData.companiesByName || companiesByName).map((group) => {
           const persisted = freshClientCertRecordsByKey.get(group.group_key) || null;
           const alreadyGenerated = persisted?.generated_file_path || existingInternalRefs.has(group.internal_reference);
           return alreadyGenerated
@@ -4625,7 +4648,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     allocatedRows: invoiceRows.filter((row) => row.allocation_status === "allocated" || row.allocation_status === "partial").length,
   };
   const clientCertificateRecordsByKey = new Map((clientCertificateRecords || []).map((row) => [row.group_key, row]));
-  const liveGroups = collectApprovedClientCertificateGroups(certs, invoiceRows).map((group) => {
+  const liveGroups = collectApprovedClientCertificateGroups(certs, invoiceRows, new Date(), companiesByName).map((group) => {
     const persisted = clientCertificateRecordsByKey.get(group.group_key) || null;
     return persisted
       ? {
@@ -4676,6 +4699,59 @@ export default function SAFManager({ onLogout, userEmail }) {
     (a.airport_code || "").localeCompare(b.airport_code || "") ||
     (a.month || "").localeCompare(b.month || "")
   );
+
+  const bulkGenerateClientCerts = async () => {
+    const toGenerate = clientCertificateGroups.filter((g) => g.can_generate && !g.generated_file_path);
+    if (!toGenerate.length) {
+      addLog("No client certificates to generate.", "info");
+      return;
+    }
+    const { generateClientCertificatePdf } = await import("./src/clientCertificatePdf.js");
+    let generated = 0;
+    let failures = 0;
+    for (let i = 0; i < toGenerate.length; i++) {
+      const group = toGenerate[i];
+      setLoading(`Generating client cert ${i + 1}/${toGenerate.length}: ${group.internal_reference}`);
+      try {
+        const pdfBytes = await generateClientCertificatePdf(group);
+        const filePath = `generated/${Date.now()}-${group.internal_reference}.pdf`;
+        const pdfBlob = new Blob([pdfBytes], { type: "application/pdf" });
+        const { error: uploadErr } = await supabase.storage
+          .from("client-certificates-pdf")
+          .upload(filePath, pdfBlob, { contentType: "application/pdf", upsert: false });
+        if (uploadErr) throw uploadErr;
+        const payload = {
+          group_key: group.group_key,
+          client_name: group.client_name,
+          airport_code: group.airport_code,
+          month: group.month,
+          total_saf_volume_m3: group.total_saf_volume_m3,
+          source_certificate_refs: group.source_certificate_refs,
+          source_certificate_ids: group.source_certificate_ids,
+          source_invoice_row_ids: group.source_invoice_row_ids,
+          source_link_ids: group.source_link_ids,
+          approved_link_count: group.approved_link_count,
+          matched_row_count: group.matched_row_count,
+          issue_date: group.issue_date,
+          internal_reference: group.internal_reference,
+          generated_file_path: filePath,
+          updated_at: new Date().toISOString(),
+        };
+        const { error: saveErr } = await supabase.from("client_certificates").upsert(payload, { onConflict: "group_key" });
+        if (saveErr) throw saveErr;
+        generated++;
+      } catch (genErr) {
+        failures++;
+        addLog(`Failed to generate ${group.internal_reference}: ${genErr.message}`, "error");
+      }
+    }
+    addLog(
+      `Client certificates: ${generated} generated` + (failures ? `, ${failures} failed` : ""),
+      failures ? "error" : "success"
+    );
+    setLoading("");
+    await loadFromDB();
+  };
 
   const coverageData = buildCoverageData(certs, clientCertificateRecords);
 
@@ -5038,14 +5114,16 @@ export default function SAFManager({ onLogout, userEmail }) {
 
                 const approvedCount = certs.filter((c) => c.match?.status === "approved").length;
                 const autoLinkedCount = certs.filter((c) => c.match?.status === "auto_linked").length;
+                const partialLinkedCount = certs.filter((c) => c.match?.status === "partial_linked").length;
                 const unmatchedCount = certs.filter((c) => c.match?.status === "unmatched").length;
                 const manualCount = certs.filter((c) => c.match?.status === "manual_only").length;
                 const processedCount = approvedCount + autoLinkedCount;
                 const processedPct = certs.length ? Math.round((processedCount / certs.length) * 100) : 0;
                 const approvedPct = certs.length ? (approvedCount / certs.length) * 100 : 0;
                 const autoLinkedPct = certs.length ? (autoLinkedCount / certs.length) * 100 : 0;
+                const partialLinkedPct = certs.length ? (partialLinkedCount / certs.length) * 100 : 0;
 
-                const statusOrder = { unmatched: 0, auto_linked: 1, manual_only: 2, approved: 3 };
+                const statusOrder = { unmatched: 0, partial_linked: 1, auto_linked: 2, manual_only: 3, approved: 4 };
                 const sortedCerts = [...certs].sort((a, b) => {
                   const sa = statusOrder[a.match?.status] ?? -1;
                   const sb = statusOrder[b.match?.status] ?? -1;
@@ -5062,6 +5140,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                 const filterBtns = [
                   { key: "", label: "ALL", count: certs.length, color: "#4a7fa0" },
                   { key: "unmatched", label: "ATTENTION", count: unmatchedCount, color: "#ff6666" },
+                  { key: "partial_linked", label: "PARTIAL", count: partialLinkedCount, color: "#ff9933" },
                   { key: "auto_linked", label: "TO APPROVE", count: autoLinkedCount, color: "#00bfff" },
                   { key: "manual_only", label: "MANUAL", count: manualCount, color: "#ffbb00" },
                   { key: "completed", label: "DONE", count: approvedCount, color: "#00ff9d" },
@@ -5077,10 +5156,12 @@ export default function SAFManager({ onLogout, userEmail }) {
                       <div style={{ height: 6, background: "#0a1628", borderRadius: 3, overflow: "hidden", display: "flex" }}>
                         <div style={{ width: `${approvedPct}%`, background: "#00ff9d", transition: "width 0.3s" }} />
                         <div style={{ width: `${autoLinkedPct}%`, background: "#00bfff", transition: "width 0.3s" }} />
+                        <div style={{ width: `${partialLinkedPct}%`, background: "#ff9933", transition: "width 0.3s" }} />
                       </div>
                       <div style={{ display: "flex", gap: 10, marginTop: 3, fontSize: 9, color: "#4a7fa0" }}>
                         <span><span style={{ color: "#00ff9d" }}>■</span> Approved</span>
                         <span><span style={{ color: "#00bfff" }}>■</span> Matched</span>
+                        <span><span style={{ color: "#ff9933" }}>■</span> Partial</span>
                       </div>
                     </div>
 
@@ -5249,13 +5330,47 @@ export default function SAFManager({ onLogout, userEmail }) {
                       <FieldRow label="FILTER COUNTS" value={formatDiagnosticsSummary(selectedCert.match?.diagnostics)} />
                       <FieldRow label="UNRESOLVED AIRPORTS" value={formatUnresolvedAirports(selectedCert.match?.diagnostics)} />
                       <FieldRow label="NOTE" value={selectedCert.match?.review_note || "Run matching to generate an allocation result."} />
+                      {(selectedCert.match?.status === "unmatched" || selectedCert.match?.status === "partial_linked") && selectedCert.match?.diagnostics ? (() => {
+                        const diag = selectedCert.match.diagnostics;
+                        const isPartial = selectedCert.match.status === "partial_linked";
+                        const totalRows = diag.total_row_count || 0;
+                        const availableRows = diag.candidate_count || 0;
+                        const accentColor = isPartial ? "#ff9933" : "#ff6666";
+                        // For unmatched: distinguish "no rows" from "rows fully consumed"
+                        const unmatchedReason = !isPartial
+                          ? totalRows === 0
+                            ? "No invoice rows found for this airport + month combination."
+                            : `${totalRows} invoice row${totalRows > 1 ? "s" : ""} found for this airport + month, but all volume is already consumed by other certificates.`
+                          : null;
+                        return (
+                          <div style={{ marginTop: 8, padding: "8px 10px", background: isPartial ? "#1a0d0022" : "#1a000022", border: `1px solid ${accentColor}44`, borderRadius: 6 }}>
+                            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 10, color: accentColor, marginBottom: 4, letterSpacing: 1 }}>
+                              {isPartial ? "SUPPLY / DEMAND GAP" : "UNMATCHED REASON"}
+                            </div>
+                            {unmatchedReason ? (
+                              <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: accentColor, marginBottom: 4 }}>
+                                {unmatchedReason}
+                              </div>
+                            ) : null}
+                            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#c8dff0" }}>
+                              Available: {Number(diag.available_volume || 0).toFixed(3)} m³ across {availableRows} invoice row{availableRows !== 1 ? "s" : ""}
+                            </div>
+                            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#c8dff0" }}>
+                              Needed: {Number(diag.certificate_volume || 0).toFixed(3)} m³
+                            </div>
+                            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: accentColor, fontWeight: 700 }}>
+                              Gap: {Number(diag.variance || 0).toFixed(3)} m³
+                            </div>
+                          </div>
+                        );
+                      })() : null}
                     </div>
 
                     <div style={{ gridColumn: "1 / -1" }}>
                       <MatchRowsTable rows={selectedCert.match?.links || []} title="LINKED INVOICE ROWS" />
                     </div>
 
-                    {selectedCert.match?.status === "auto_linked" ? (
+                    {(selectedCert.match?.status === "auto_linked" || selectedCert.match?.status === "partial_linked") ? (
                       <div
                         style={{
                           gridColumn: "1 / -1",
@@ -5281,7 +5396,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                             border: "1px solid #00ff9d44",
                           }}
                         >
-                          APPROVE
+                          APPROVE{selectedCert.match?.status === "partial_linked" ? " PARTIAL" : ""}
                         </button>
                         <button
                           className="btn"
@@ -5302,7 +5417,9 @@ export default function SAFManager({ onLogout, userEmail }) {
                           REJECT
                         </button>
                         <span style={{ color: "#4a7fa0", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
-                          This certificate was auto-linked by the FIFO algorithm. Approve to enable client certificate generation.
+                          {selectedCert.match?.status === "partial_linked"
+                            ? `Partial match: ${Number(selectedCert.match?.allocated_volume_m3 || 0).toFixed(3)} m³ allocated / ${Number(selectedCert.match?.cert_volume_m3 || 0).toFixed(3)} m³ needed (gap: ${Number(selectedCert.match?.variance_m3 || 0).toFixed(3)} m³). Approve to accept partial allocation.`
+                            : "This certificate was auto-linked by the FIFO algorithm. Approve to enable client certificate generation."}
                         </span>
                       </div>
                     ) : null}
@@ -5540,6 +5657,30 @@ export default function SAFManager({ onLogout, userEmail }) {
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                {(() => {
+                  const pendingCount = clientCertificateGroups.filter((g) => g.can_generate && !g.generated_file_path).length;
+                  return pendingCount > 0 ? (
+                    <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+                      <button
+                        className="btn"
+                        onClick={bulkGenerateClientCerts}
+                        disabled={!!loading}
+                        style={{
+                          background: "linear-gradient(135deg,#0050aa,#00bfff)",
+                          color: "#fff",
+                          padding: "8px 18px",
+                          borderRadius: 6,
+                          fontFamily: "'Space Mono', monospace",
+                          fontSize: 11,
+                          letterSpacing: 1,
+                          border: "none",
+                        }}
+                      >
+                        GENERATE ALL ({pendingCount})
+                      </button>
+                    </div>
+                  ) : null;
+                })()}
                 {clientCertificateGroups.map((group) => (
                   <div
                     key={group.group_key}

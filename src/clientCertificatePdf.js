@@ -11,6 +11,10 @@ const PAGE = {
   margin: 42,
 };
 
+function sanitizeForPdf(text) {
+  return String(text ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
 function drawLabelValue(page, font, boldFont, x, y, label, value, options = {}) {
   const labelWidth = options.labelWidth ?? 180;
   const valueWidth = options.valueWidth ?? 220;
@@ -21,7 +25,7 @@ function drawLabelValue(page, font, boldFont, x, y, label, value, options = {}) 
     size: 9,
     color: rgb(0.31, 0.50, 0.63),
   });
-  page.drawText(String(value ?? ""), {
+  page.drawText(sanitizeForPdf(value), {
     x: x + labelWidth,
     y,
     font: options.bold ? boldFont : font,
@@ -85,20 +89,21 @@ export async function generateClientCertificatePdf(group) {
   const leftX = PAGE.margin;
   const topY = PAGE.height - 174;
   const columnWidth = (PAGE.width - PAGE.margin * 2 - 16) / 2;
+  const boxHeight = group.client_address ? 124 : 108;
 
   page.drawRectangle({
     x: leftX,
-    y: topY - 108,
+    y: topY - boxHeight,
     width: columnWidth,
-    height: 108,
+    height: boxHeight,
     borderWidth: 1,
     borderColor: rgb(0.05, 0.19, 0.38),
   });
   page.drawRectangle({
     x: leftX + columnWidth + 16,
-    y: topY - 108,
+    y: topY - boxHeight,
     width: columnWidth,
-    height: 108,
+    height: boxHeight,
     borderWidth: 1,
     borderColor: rgb(0.05, 0.19, 0.38),
   });
@@ -138,16 +143,23 @@ export async function generateClientCertificatePdf(group) {
     labelWidth: 60,
     valueWidth: columnWidth - 90,
   });
-  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - 60, "Airport", group.airport_code, {
+  if (group.client_address) {
+    drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - 56, "Address", group.client_address, {
+      labelWidth: 60,
+      valueWidth: columnWidth - 90,
+      size: 8,
+    });
+  }
+  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - (group.client_address ? 76 : 60), "Airport", group.airport_code, {
     labelWidth: 60,
     valueWidth: columnWidth - 90,
   });
-  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - 80, "Period", formatClientCertificateMonth(group.month), {
+  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - (group.client_address ? 92 : 80), "Period", formatClientCertificateMonth(group.month), {
     labelWidth: 60,
     valueWidth: columnWidth - 90,
   });
 
-  const summaryY = topY - 140;
+  const summaryY = topY - boxHeight - 16;
   page.drawRectangle({
     x: PAGE.margin,
     y: summaryY - 118,

@@ -72,7 +72,18 @@ export function formatClientCertificateVolume(value) {
   return numeric === null ? "" : numeric.toFixed(3);
 }
 
-export function collectApprovedClientCertificateGroups(certs, invoiceRows, issueDate = new Date()) {
+function buildClientAddress(company) {
+  if (!company) return "";
+  const parts = [];
+  const street = [company.street, company.street_no].filter(Boolean).join(" ").trim();
+  if (street) parts.push(street);
+  const cityLine = [company.zip, company.city].filter(Boolean).join(" ").trim();
+  if (cityLine) parts.push(cityLine);
+  if (company.country) parts.push(company.country);
+  return parts.join(", ");
+}
+
+export function collectApprovedClientCertificateGroups(certs, invoiceRows, issueDate = new Date(), companiesByName = null) {
   const issueDateIso = toDateOnly(issueDate) || new Date().toISOString().slice(0, 10);
   const invoiceRowById = new Map((invoiceRows || []).map((row) => [row.id, row]));
   const groups = new Map();
@@ -107,6 +118,7 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
             month,
             issueDate: issueDateIso,
           }),
+          client_address: companiesByName ? buildClientAddress(companiesByName.get(clientName.toLowerCase())) : "",
           total_saf_volume_m3: 0,
           source_certificate_refs: [],
           source_certificate_ids: [],
@@ -160,6 +172,7 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
       return {
         group_key: group.group_key,
         client_name: group.client_name,
+        client_address: group.client_address,
         airport_code: group.airport_code,
         month: group.month,
         month_label: group.month_label,
