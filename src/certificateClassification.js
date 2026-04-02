@@ -322,6 +322,37 @@ function inferMonthFromText(text) {
   return formatYearMonth(startOfMonthUTC(year, monthIndex));
 }
 
+const QUARTER_MONTH_OFFSETS = { 1: [0, 2], 2: [3, 5], 3: [6, 8], 4: [9, 11] };
+
+function inferQuarterFromText(text) {
+  const str = String(text ?? "").trim();
+  if (!str) return null;
+
+  const digitFirst = str.match(/\b([1-4])Q\s*[''\u2019]?(\d{2,4})\b/i);
+  const qFirst = str.match(/\bQ([1-4])\s*[-/]?\s*[''\u2019]?(\d{2,4})\b/i);
+  const match = digitFirst || qFirst;
+  if (!match) return null;
+
+  const quarter = Number(match[1]);
+  const rawYear = match[2];
+  const year = rawYear.length === 2 ? 2000 + Number(rawYear) : Number(rawYear);
+  if (!Number.isFinite(year) || year < 2000 || year > 2100) return null;
+
+  const [startMonth, endMonth] = QUARTER_MONTH_OFFSETS[quarter];
+  const start = startOfMonthUTC(year, startMonth);
+  const end = endOfMonthUTC(year, endMonth);
+
+  return {
+    quarter,
+    year,
+    coverageStart: toISODate(start),
+    coverageEnd: toISODate(end),
+    coverageMonth: formatYearMonth(start),
+    quarterLabel: `Q${quarter} ${year}`,
+    raw: match[0],
+  };
+}
+
 function parseRangeFromValue(value) {
   const matches =
     String(value ?? "")
@@ -382,6 +413,21 @@ function deriveSimpleMonthCoverage(data, context = {}) {
   }
 
   for (const text of getCertificateAdditionalInfoTexts(data)) {
+    const quarterResult = inferQuarterFromText(text);
+    if (quarterResult) {
+      return {
+        coverageGranularity: "quarter",
+        coverageMonth: quarterResult.coverageMonth,
+        coverageStart: quarterResult.coverageStart,
+        coverageEnd: quarterResult.coverageEnd,
+        coverageSource: "additional-information",
+        matchingEvidence: "additional-information-quarter",
+        isAmbiguous: false,
+        ambiguityReason: "",
+        isQuarterly: true,
+        quarterLabel: quarterResult.quarterLabel,
+      };
+    }
     addCandidate(inferMonthFromText(text), "additional-information", "additional-information-month");
   }
 
@@ -513,7 +559,7 @@ export function deriveCertificateClassification(data, context = {}) {
   return buildSupportedClassification(coverage, [
     `${certKind.toUpperCase()} certificate`,
     `1 airport (${airportCodes[0]})`,
-    `1 month (${coverage.coverageMonth})`,
+    coverage.isQuarterly ? `1 quarter (${coverage.quarterLabel})` : `1 month (${coverage.coverageMonth})`,
     `1 SAF volume (${quantity} m3)`,
     "no complex tables",
     underlyingPoSCount === 1 ? "1 underlying certificate" : "no multiple underlying certificates",

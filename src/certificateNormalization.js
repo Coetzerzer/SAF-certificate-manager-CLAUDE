@@ -224,6 +224,36 @@ function buildSimpleMonthlyUnits(data, airports, warnings) {
     return [];
   }
   const airportMeta = buildAirportDescriptor(airports[0], "—");
+  const isQuarterly = data?.coverageGranularity === "quarter";
+
+  if (isQuarterly) {
+    if (!data?.coverageStart || !data?.coverageEnd) {
+      warnings.push("Quarterly certificate is missing coverageStart/coverageEnd dates.");
+    }
+    if (airports.length > 1) warnings.push("Simple quarterly path expects one airport, but multiple airports were extracted.");
+
+    return [
+      createBaseUnit({
+        key: "simple-quarterly-airport",
+        unitType: "quarterly-airport",
+        airport: airportMeta.label,
+        airportIata: airportMeta.iata,
+        airportIcao: airportMeta.icao,
+        airportName: airportMeta.name,
+        periodStart: data?.coverageStart || "",
+        periodEnd: data?.coverageEnd || "",
+        dispatchDate: data?.dateDispatch || "",
+        safVolume: data?.quantity,
+        jetVolume: data?.totalVolume,
+        quantityUnit: data?.quantityUnit || "",
+        source: "certificate aggregate",
+        sourceReference: data?.uniqueNumber || data?.filename || "certificate",
+        matchingModeOverride: "simple_monthly_airport",
+        notes: `Simple supported airport-quarter volume for ${data?.coverageStart} to ${data?.coverageEnd}.`,
+      }),
+    ];
+  }
+
   const monthBounds = makeMonthBounds(data?.coverageMonth || data?.coverageStart || data?.dateDispatch);
   if (!monthBounds.month) warnings.push("Simple monthly normalization could not confirm the covered month.");
   if (airports.length > 1) warnings.push("Simple monthly path expects one airport, but multiple airports were extracted.");
@@ -307,7 +337,10 @@ function buildTransformations(data, classification, airports, units, warnings) {
   ];
 
   if (classification.matching_mode === "simple_monthly_airport") {
-    steps.push("A single airport-month allocation unit was generated for deterministic FIFO matching.");
+    const isQuarterly = data?.coverageGranularity === "quarter";
+    steps.push(isQuarterly
+      ? "A single airport-quarter allocation unit was generated for deterministic FIFO matching across the quarter."
+      : "A single airport-month allocation unit was generated for deterministic FIFO matching.");
   } else {
     steps.push("A manual-only aggregate allocation unit was generated because the certificate falls outside the supported scope.");
   }

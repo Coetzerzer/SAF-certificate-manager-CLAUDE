@@ -325,6 +325,34 @@ function getCertificateAdditionalInfoTexts(data) {
   return dedupeBy(values, (value) => value);
 }
 
+const QUARTER_MONTH_OFFSETS = { 1: [0, 2], 2: [3, 5], 3: [6, 8], 4: [9, 11] };
+
+function inferQuarterCoverage(text) {
+  const str = String(text ?? "").trim();
+  if (!str) return null;
+  const digitFirst = str.match(/\b([1-4])Q\s*['''\u2019]?(\d{2,4})\b/i);
+  const qFirst = str.match(/\bQ([1-4])\s*[-/]?\s*['''\u2019]?(\d{2,4})\b/i);
+  const match = digitFirst || qFirst;
+  if (!match) return null;
+  const quarter = Number(match[1]);
+  const rawYear = match[2];
+  const year = rawYear.length === 2 ? 2000 + Number(rawYear) : Number(rawYear);
+  if (!Number.isFinite(year) || year < 2000 || year > 2100) return null;
+  const [startMonth, endMonth] = QUARTER_MONTH_OFFSETS[quarter];
+  const start = startOfMonthUTC(year, startMonth);
+  const end = endOfMonthUTC(year, endMonth);
+  return {
+    matchingMode: "monthly-pos",
+    coverageGranularity: "quarter",
+    coverageMonth: formatYearMonth(start),
+    coverageStart: toISODate(start),
+    coverageEnd: toISODate(end),
+    coverageSource: "additional-information",
+    matchingEvidence: "additional-information-quarter",
+    quarterLabel: `Q${quarter} ${year}`,
+  };
+}
+
 function inferMonthlyCoverage(data) {
   const textSources = [
     ...getCertificateAdditionalInfoTexts(data),
@@ -332,6 +360,9 @@ function inferMonthlyCoverage(data) {
   ].filter(Boolean);
 
   for (const text of textSources) {
+    const quarterResult = inferQuarterCoverage(text);
+    if (quarterResult) return quarterResult;
+
     const match = text.match(/\bSAF\s+Delivery\s+([A-Za-z]+)\s+(\d{4})\b/i) || text.match(/\bDelivery\s+([A-Za-z]+)\s+(\d{4})\b/i);
     if (!match) continue;
 
@@ -1145,14 +1176,24 @@ function tokenizeName(value) {
 }
 
 function parseCSVGrid(text) {
+  // Strip UTF-8 BOM if present
+  const clean = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+
+  // Auto-detect delimiter from the first line (header row)
+  const firstLineEnd = clean.indexOf("\n");
+  const firstLine = firstLineEnd >= 0 ? clean.slice(0, firstLineEnd).replace(/\r$/, "") : clean;
+  const semicolonCount = (firstLine.match(/;/g) || []).length;
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  const delimiter = semicolonCount > commaCount ? ";" : ",";
+
   const rows = [];
   let row = [];
   let field = "";
   let inQuotes = false;
 
-  for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    const next = text[i + 1];
+  for (let i = 0; i < clean.length; i += 1) {
+    const char = clean[i];
+    const next = clean[i + 1];
 
     if (char === '"') {
       if (inQuotes && next === '"') {
@@ -1164,7 +1205,7 @@ function parseCSVGrid(text) {
       continue;
     }
 
-    if (char === "," && !inQuotes) {
+    if (char === delimiter && !inQuotes) {
       row.push(field);
       field = "";
       continue;
@@ -1184,6 +1225,22 @@ function parseCSVGrid(text) {
 
   row.push(field);
   if (row.some((cell) => cell !== "")) rows.push(row);
+
+  // Fix mixed-delimiter rows: if the primary delimiter is comma but some data rows
+  // used semicolons (or vice versa), those rows appear as a single field. Re-split them.
+  if (rows.length > 1) {
+    const expectedCols = rows[0].length;
+    const altDelimiter = delimiter === "," ? ";" : ",";
+    for (let r = 1; r < rows.length; r += 1) {
+      if (rows[r].length === 1 && rows[r][0].includes(altDelimiter)) {
+        const reParsed = rows[r][0].split(altDelimiter);
+        if (reParsed.length === expectedCols) {
+          rows[r] = reParsed;
+        }
+      }
+    }
+  }
+
   return rows;
 }
 
@@ -4633,6 +4690,10 @@ export default function SAFManager({ onLogout, userEmail }) {
     normalizeMonthValue(normalizedSelectedCert?.interpreted_period_start) ||
     normalizeMonthValue(normalizedSelectedCert?.interpreted_dispatch_date) ||
     "";
+  const selectedIsQuarterly = selectedCert?.data?.coverageGranularity === "quarter";
+  const selectedPeriodLabel = selectedIsQuarterly
+    ? `${selectedCert?.data?.coverageStart} to ${selectedCert?.data?.coverageEnd}`
+    : selectedInterpretedMonth;
   const selectedSupportReason =
     selectedCert?.support_reason ||
     selectedCert?.data?.support_reason ||
@@ -4908,7 +4969,8 @@ export default function SAFManager({ onLogout, userEmail }) {
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           {invoiceImport ? (
             <div style={{ color: "#4a7fa0", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
-              2025 CSV: {invoiceImport.filename} · {invoiceImport.row_count} rows
+              2025 CSV: {invoiceImport.filename} · {invoiceImport.candidate_row_count || invoiceImport.row_count} rows
+              {invoiceImport.invalid_row_count ? ` (${invoiceImport.invalid_row_count} invalid)` : ""}
               {invoiceImport.status ? ` · ${String(invoiceImport.status).toUpperCase()}` : ""}
             </div>
           ) : null}
@@ -5267,7 +5329,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                         INTERPRETED MATCHING SCOPE
                       </div>
                       <FieldRow label="AIRPORT" value={formatListValue(normalizedSelectedCert?.interpreted_airports)} highlight />
-                      <FieldRow label="MONTH" value={selectedInterpretedMonth} highlight />
+                      <FieldRow label={selectedIsQuarterly ? "QUARTER" : "MONTH"} value={selectedPeriodLabel} highlight />
                       <FieldRow
                         label="SAF VOLUME M3"
                         value={
@@ -5337,10 +5399,11 @@ export default function SAFManager({ onLogout, userEmail }) {
                         const availableRows = diag.candidate_count || 0;
                         const accentColor = isPartial ? "#ff9933" : "#ff6666";
                         // For unmatched: distinguish "no rows" from "rows fully consumed"
+                        const periodLabel = (diag.coverage_granularity === "quarter" || selectedIsQuarterly) ? "quarter" : "month";
                         const unmatchedReason = !isPartial
                           ? totalRows === 0
-                            ? "No invoice rows found for this airport + month combination."
-                            : `${totalRows} invoice row${totalRows > 1 ? "s" : ""} found for this airport + month, but all volume is already consumed by other certificates.`
+                            ? `No invoice rows found for this airport + ${periodLabel} combination.`
+                            : `${totalRows} invoice row${totalRows > 1 ? "s" : ""} found for this airport + ${periodLabel}, but all volume is already consumed by other certificates.`
                           : null;
                         return (
                           <div style={{ marginTop: 8, padding: "8px 10px", background: isPartial ? "#1a0d0022" : "#1a000022", border: `1px solid ${accentColor}44`, borderRadius: 6 }}>
@@ -5561,7 +5624,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                 if (searchLower && !(row.customer || "").toLowerCase().includes(searchLower) && !(row.invoice_no || "").toLowerCase().includes(searchLower)) return false;
                 return true;
               });
-              const uniqueAirports = [...new Set(invoiceRows.map((r) => r.iata).filter(Boolean))].sort();
+              const uniqueAirports = [...new Set(invoiceRows.map((r) => r.iata).filter((a) => a && /^[A-Z]{3,4}$/.test(a)))].sort();
               const uniqueMonths = [...new Set(invoiceRows.map((r) => getRowMonth(r)).filter(Boolean))].sort();
               return (
                 <>
