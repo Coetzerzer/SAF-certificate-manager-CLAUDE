@@ -3760,13 +3760,40 @@ export default function SAFManager({ onLogout, userEmail }) {
 
       if (!isCurrentRequest()) return;
 
+      // Verify client certificate PDFs still exist in storage; clear stale references
+      const clientCertRecords = clientCertRes.data || [];
+      const withPaths = clientCertRecords.filter((r) => r.generated_file_path);
+      if (withPaths.length > 0) {
+        const checks = await Promise.all(
+          withPaths.map((r) =>
+            supabase.storage
+              .from("client-certificates-pdf")
+              .createSignedUrl(r.generated_file_path, 1)
+              .then(({ error }) => (error ? r : null))
+          )
+        );
+        const stale = checks.filter(Boolean);
+        if (stale.length > 0) {
+          const staleIds = new Set(stale.map((r) => r.id));
+          for (const r of stale) {
+            addLog(`Client certificate "${r.internal_reference || r.group_key}": PDF missing from storage, clearing stale reference`, "warn");
+            supabase.from("client_certificates").update({ generated_file_path: null }).eq("id", r.id).then(({ error }) => {
+              if (error) addLog(`Failed to clear stale path for ${r.group_key}: ${error.message}`, "error");
+            });
+          }
+          for (const r of clientCertRecords) {
+            if (staleIds.has(r.id)) r.generated_file_path = null;
+          }
+        }
+      }
+
       setInvoiceImport(nextInvoiceImport);
       setInvoiceRows(hydratedInvoiceRows);
       setCerts(hydrated);
-      setClientCertificateRecords(clientCertRes.data || []);
+      setClientCertificateRecords(clientCertRecords);
       setCompaniesByName(companiesByName);
       addLog(`Loaded ${hydrated.length} certificate(s) and ${hydratedInvoiceRows.length} invoice row(s)`, "success");
-      return { certs: hydrated, invoiceRows: hydratedInvoiceRows, clientCertificateRecords: clientCertRes.data || [], companiesByName };
+      return { certs: hydrated, invoiceRows: hydratedInvoiceRows, clientCertificateRecords: clientCertRecords, companiesByName };
     } catch (error) {
       if (isCurrentRequest()) addLog(`DB reload failed: ${error.message}`, "error");
       return null;
