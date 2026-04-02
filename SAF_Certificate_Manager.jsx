@@ -1585,7 +1585,7 @@ async function extractCertificateFromBase64(base64, filename) {
 
   return {
     parsed: normalizeCommaDecimals(data.parsed),
-    model: data.model || "gpt-5-mini",
+    model: data.model || "claude-sonnet-4-20250514",
     usage: data.usage || null,
     responseId: data.response_id || null,
   };

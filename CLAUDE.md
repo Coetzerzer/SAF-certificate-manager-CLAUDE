@@ -16,16 +16,16 @@ No test runner is configured.
 
 The frontend does not need an AI API key anymore.
 
-Set the OpenAI key as a Supabase Edge Function secret:
+Set the Anthropic key as a Supabase Edge Function secret:
 
 ```
-OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 Optional:
 
 ```
-OPENAI_MODEL=gpt-5-mini
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
 ```
 
 The Supabase client is hardcoded in `src/supabase.js` (URL + publishable key). No env variable needed in the frontend for Supabase.
@@ -38,7 +38,7 @@ This is a single-file React application (`SAF_Certificate_Manager.jsx`) with no 
 
 ### Data flow
 
-1. **PDF upload** → Supabase Edge Function (`extract-certificate`) → OpenAI Responses API → structured JSON cert data → Supabase `certificates` table + `certificates-pdf` storage bucket
+1. **PDF upload** → Supabase Edge Function (`extract-certificate`) → Anthropic Messages API (Claude Sonnet) → structured JSON cert data → Supabase `certificates` table + `certificates-pdf` storage bucket
 2. **CSV upload** → staged import pipeline: file to `invoices-csv` bucket → metadata row in `invoice_imports` (status=staging) → rows inserted into `invoice_rows` → `activate_invoice_import()` RPC supersedes previous active import for the same year, clears year-scoped matches, activates new import
 3. **On mount** (`loadFromDB`): loads all certs from `certificates` table + latest active invoice import + invoice rows from `invoice_rows` + matches/links/allocation units. Falls back to legacy `invoices` table if no `invoice_imports` exist.
 4. **Matching** → DB-side FIFO allocation via `allocate_simple_certificate` stored procedure → filters invoice rows by airport code + coverage month → allocates by uplift date → saved into `certificate_matches` + `certificate_invoice_links`
@@ -54,7 +54,7 @@ This is a single-file React application (`SAF_Certificate_Manager.jsx`) with no 
 | Function | Purpose |
 |---|---|
 | `loadFromDB` | Loads certs + latest CSV on mount |
-| `handlePDFUpload` | Extracts cert from PDF via Supabase Edge Function + OpenAI, upserts to DB |
+| `handlePDFUpload` | Extracts cert from PDF via Supabase Edge Function + Anthropic Claude, upserts to DB |
 | `handleCSVUpload` | Uploads CSV to storage, inserts staged import row, activates import |
 | `analyzeAll` / `analyzeSingle` | Runs DB-side FIFO allocation via `allocate_simple_certificate` stored procedure |
 | `reExtractCert` | Downloads stored PDF from bucket, re-runs extraction via Edge Function |

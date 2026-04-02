@@ -4,7 +4,7 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const OPENAI_MODEL = Deno.env.get("OPENAI_MODEL") || "gpt-5-mini";
+const ANTHROPIC_MODEL = Deno.env.get("ANTHROPIC_MODEL") || "claude-sonnet-4-20250514";
 
 const EXTRACT_PROMPT = `You are an expert in SAF (Sustainable Aviation Fuel) certification documents.
 Extract ALL of the following fields from this certificate PDF. Return ONLY a valid JSON object with these exact keys:
@@ -37,10 +37,10 @@ Extract ALL of the following fields from this certificate PDF. Return ONLY a val
   "productType": "",
   "rawMaterial": "",
   "rawMaterialOrigin": "",
-  "quantity": "for PoS: the SAF quantity. For PoC: the bio/SAF component quantity (NOT the total fossil+bio volume)",
+  "quantity": "the physical VOLUME or MASS of SAF (in m3, litres, MT, kg). NEVER put energy content (MJ) here. For PoS: the SAF volume. For PoC: the bio/SAF component volume (NOT the total fossil+bio volume)",
   "totalVolume": "for PoC only: total physical JET A-1 volume including fossil component",
   "quantityUnit": "m3, litres, MT, etc.",
-  "energyContent": "",
+  "energyContent": "the energy value in MJ (or GJ/kWh). This is separate from the physical volume — do NOT confuse with quantity",
   "euRedCompliant": "",
   "isccCompliant": "",
   "chainOfCustody": "",
@@ -104,6 +104,8 @@ IMPORTANT RULES:
 - airportVolumes: if the document lists volumes per airport (but not per month), extract each row with "airport", "country", "quantity", "quantityUnit". Leave as [] if not present.
 - If a field is not present, use empty string "" (or empty array [] for underlyingPoSList/monthlyVolumes/airportVolumes).
 - NUMBERS: always use a dot "." as the decimal separator, never a comma. E.g. write 5.599 not 5,599 — even if the source document uses European comma-decimal formatting.
+- QUANTITY vs ENERGY — THIS IS CRITICAL: The PDF typically has a "Quantity" row (with m3/15°C, litres, MT, kg) and a separate "Energy content" row (with MJ). You MUST map the VOLUME from the "Quantity" row into the "quantity" JSON field, and the MJ value from the "Energy content" row into the "energyContent" JSON field. Do NOT swap them. Self-check: if your "quantity" value is in MJ or your "energyContent" is in m3, you have them backwards — fix it. For SAF, energy content in MJ is typically much larger than volume in m3 (roughly 33,000 MJ per m3).
+- CRITICAL NUMBER RULE: In European documents, a comma is ALWAYS a decimal separator, NEVER a thousands separator. European documents use spaces or dots for thousands grouping. So "2,080" means 2.080 (about two), "43,115" means 43.115 (about forty-three), "2 328,388" means 2328.388. Never interpret a comma as a thousands separator in these documents. When in doubt, check if the numeric magnitude makes sense in context (SAF volumes are typically 0.1–500 m3, not thousands).
 - Return ONLY the JSON, no markdown, no explanation.`;
 
 function jsonResponse(body: unknown, status = 200) {
@@ -114,20 +116,12 @@ function jsonResponse(body: unknown, status = 200) {
 }
 
 function extractOutputText(payload: any) {
-  if (typeof payload?.output_text === "string" && payload.output_text.trim()) {
-    return payload.output_text.trim();
-  }
-
-  const blocks = [];
-  for (const item of payload?.output || []) {
-    for (const content of item?.content || []) {
-      if (typeof content?.text === "string" && content.text.trim()) {
-        blocks.push(content.text);
-      }
+  for (const block of payload?.content || []) {
+    if (block?.type === "text" && typeof block?.text === "string" && block.text.trim()) {
+      return block.text.trim();
     }
   }
-
-  return blocks.join("\n").trim();
+  return "";
 }
 
 function normalizeCommaDecimals(parsed: Record<string, unknown>) {
@@ -180,9 +174,9 @@ Deno.serve(async (req) => {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) {
-    return jsonResponse({ error: "OPENAI_API_KEY secret is not configured." }, 500);
+    return jsonResponse({ error: "ANTHROPIC_API_KEY secret is not configured." }, 500);
   }
 
   try {
@@ -192,27 +186,31 @@ Deno.serve(async (req) => {
       return jsonResponse({ error: "Missing base64 PDF payload." }, 400);
     }
 
-    const openAiResponse = await fetch("https://api.openai.com/v1/responses", {
+    const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        "x-api-key": apiKey,
+        "anthropic-version": "2024-10-22",
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
-        reasoning: { effort: "medium" },
-        max_output_tokens: 4096,
-        input: [
+        model: ANTHROPIC_MODEL,
+        max_tokens: 16384,
+        temperature: 0,
+        messages: [
           {
             role: "user",
             content: [
               {
-                type: "input_file",
-                filename: filename || "certificate.pdf",
-                file_data: `data:application/pdf;base64,${base64}`,
+                type: "document",
+                source: {
+                  type: "base64",
+                  media_type: "application/pdf",
+                  data: base64,
+                },
               },
               {
-                type: "input_text",
+                type: "text",
                 text: EXTRACT_PROMPT,
               },
             ],
@@ -221,15 +219,15 @@ Deno.serve(async (req) => {
       }),
     });
 
-    const payload = await openAiResponse.json();
+    const payload = await anthropicResponse.json();
 
-    if (!openAiResponse.ok) {
+    if (!anthropicResponse.ok) {
       return jsonResponse(
         {
-          error: payload?.error?.message || "OpenAI extraction failed.",
+          error: payload?.error?.message || "Anthropic extraction failed.",
           details: payload,
         },
-        openAiResponse.status
+        anthropicResponse.status
       );
     }
 
@@ -237,7 +235,7 @@ Deno.serve(async (req) => {
     if (!outputText) {
       return jsonResponse(
         {
-          error: "OpenAI returned no extractable text output.",
+          error: "Anthropic returned no extractable text output.",
           details: payload,
         },
         502
@@ -246,6 +244,29 @@ Deno.serve(async (req) => {
 
     const clean = outputText.replace(/```json|```/g, "").trim();
     const parsed = normalizeCommaDecimals(JSON.parse(clean));
+
+    // Post-extraction: detect swapped quantity / energyContent.
+    // SAF energy density is ~33 MJ/litre = ~33,000 MJ/m3.
+    // If energyContent looks like a small volume and quantity looks like energy, swap them.
+    const qtyNum = parseFloat(String(parsed.quantity));
+    const ecNum = parseFloat(String(parsed.energyContent));
+    const qtyUnit = String(parsed.quantityUnit || "").toLowerCase();
+    if (
+      Number.isFinite(qtyNum) &&
+      Number.isFinite(ecNum) &&
+      ecNum > 0 &&
+      qtyNum > 0 &&
+      (qtyUnit.includes("m3") || qtyUnit.includes("litre") || qtyUnit.includes("mt") || qtyUnit.includes("kg")) &&
+      ecNum < qtyNum &&
+      ecNum < 5 &&
+      qtyNum > 5
+    ) {
+      // Very likely swapped: energyContent is tiny (looks like volume) and quantity is large (looks like MJ)
+      const tmp = parsed.quantity;
+      parsed.quantity = parsed.energyContent;
+      parsed.energyContent = tmp;
+      parsed._swapCorrected = "quantity and energyContent were swapped by the model and auto-corrected";
+    }
 
     // Validate critical fields exist
     const missingFields: string[] = [];
@@ -258,7 +279,7 @@ Deno.serve(async (req) => {
 
     return jsonResponse({
       parsed,
-      model: payload.model || OPENAI_MODEL,
+      model: payload.model || ANTHROPIC_MODEL,
       usage: payload.usage || null,
       response_id: payload.id || null,
     });
