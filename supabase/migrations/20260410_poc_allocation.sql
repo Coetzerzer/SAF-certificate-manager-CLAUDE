@@ -92,8 +92,19 @@ begin
   delete from public.certificate_matches
   where certificate_id = p_certificate_id;
 
-  -- Reserve a match_id shared by all links
+  -- Reserve a match_id shared by all links; insert a provisional match row
+  -- so that per-unit link inserts can reference it via FK.
   v_match_id := gen_random_uuid();
+
+  insert into public.certificate_matches (
+    id, certificate_id, status, match_method,
+    cert_volume_m3, allocated_volume_m3, variance_m3,
+    diagnostics, created_at, updated_at
+  ) values (
+    v_match_id, p_certificate_id, 'pending', 'fifo-poc-monthly-airport',
+    v_certificate_volume, 0, v_certificate_volume,
+    '{}'::jsonb, now(), now()
+  );
 
   -- Loop over allocation units ordered by unit_index
   for v_unit in
@@ -247,6 +258,33 @@ begin
         updated_at          = now()
     where id = v_unit.id;
 
+    -- Insert this unit's links immediately so next unit sees them in remaining_saf_m3
+    if jsonb_array_length(v_unit_linked_rows) > 0 then
+      insert into public.certificate_invoice_links (
+        id, certificate_match_id, certificate_id, invoice_row_id,
+        row_number, invoice_no, customer, uplift_date, iata, icao,
+        allocated_m3, allocation_unit_id, allocation_unit_index, allocation_unit_type,
+        created_at
+      )
+      select
+        gen_random_uuid(),
+        v_match_id,
+        p_certificate_id,
+        (item->>'invoice_row_id')::uuid,
+        (item->>'row_number')::int,
+        item->>'invoice_no',
+        item->>'customer',
+        (item->>'uplift_date')::date,
+        item->>'iata',
+        item->>'icao',
+        (item->>'allocated_m3')::numeric(18,6),
+        (item->>'allocation_unit_id')::uuid,
+        (item->>'allocation_unit_index')::int,
+        item->>'allocation_unit_type',
+        now()
+      from jsonb_array_elements(v_unit_linked_rows) item;
+    end if;
+
     -- Accumulate for aggregate result
     v_total_allocated := round(v_total_allocated + v_unit_allocated, 6);
     v_all_linked_rows := v_all_linked_rows || v_unit_linked_rows;
@@ -290,50 +328,15 @@ begin
     'unit_breakdown',     v_unit_breakdown
   );
 
-  -- Upsert aggregate certificate_matches row
-  insert into public.certificate_matches (
-    id, certificate_id, status, match_method,
-    cert_volume_m3, allocated_volume_m3, variance_m3,
-    diagnostics, created_at, updated_at
-  ) values (
-    v_match_id,
-    p_certificate_id,
-    v_overall_status,
-    'fifo-poc-monthly-airport',
-    v_certificate_volume,
-    v_total_allocated,
-    round(v_certificate_volume - v_total_allocated, 6),
-    v_diagnostics,
-    now(),
-    now()
-  );
-
-  -- Insert all links (with allocation_unit_id per link)
-  if jsonb_array_length(v_all_linked_rows) > 0 then
-    insert into public.certificate_invoice_links (
-      id, certificate_match_id, certificate_id, invoice_row_id,
-      row_number, invoice_no, customer, uplift_date, iata, icao,
-      allocated_m3, allocation_unit_id, allocation_unit_index, allocation_unit_type,
-      created_at
-    )
-    select
-      gen_random_uuid(),
-      v_match_id,
-      p_certificate_id,
-      (item->>'invoice_row_id')::uuid,
-      (item->>'row_number')::int,
-      item->>'invoice_no',
-      item->>'customer',
-      (item->>'uplift_date')::date,
-      item->>'iata',
-      item->>'icao',
-      (item->>'allocated_m3')::numeric(18,6),
-      (item->>'allocation_unit_id')::uuid,
-      (item->>'allocation_unit_index')::int,
-      item->>'allocation_unit_type',
-      now()
-    from jsonb_array_elements(v_all_linked_rows) item;
-  end if;
+  -- Update the provisional certificate_matches row with final results
+  update public.certificate_matches
+  set status             = v_overall_status,
+      cert_volume_m3     = v_certificate_volume,
+      allocated_volume_m3 = v_total_allocated,
+      variance_m3        = round(v_certificate_volume - v_total_allocated, 6),
+      diagnostics        = v_diagnostics,
+      updated_at         = now()
+  where id = v_match_id;
 
   return jsonb_build_object(
     'certificate_id',        p_certificate_id,
