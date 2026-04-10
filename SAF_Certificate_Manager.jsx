@@ -3278,7 +3278,7 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
       }}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-        <div>
+        <div style={{ minWidth: 0 }}>
           <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 11, marginBottom: 4 }}>
             {cert.data?.docType || "CERTIFICATE"}
           </div>
@@ -3298,23 +3298,24 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
                 textAlign: "left",
                 textDecoration: "underline",
                 textUnderlineOffset: 3,
+                wordBreak: "break-all",
               }}
             >
               {certTitle(cert)}
             </button>
           ) : (
-            <div style={{ color: "#e0f0ff", fontWeight: 600, fontSize: 13 }}>{certTitle(cert)}</div>
+            <div style={{ color: "#e0f0ff", fontWeight: 600, fontSize: 13, wordBreak: "break-all" }}>{certTitle(cert)}</div>
           )}
           <div style={{ color: "#4a7fa0", fontSize: 11, marginTop: 3 }}>
             {formatVolume(cert.data?.quantity)} {cert.data?.quantityUnit || "m3"}
             {Number(cert.data?.quantity) > 50 ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Volume exceeds 50 m³ — verify PDF extraction. This is likely a number format error.">⚠ VOLUME?</span> : null}
             {cert.match?.status === "partial_linked" && Number(cert.match?.cert_volume_m3) > 0 && Number(cert.match?.allocated_volume_m3) / Number(cert.match?.cert_volume_m3) < 0.10 && !cert.match?.match_method?.includes("widened") ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Only a fraction of the volume was allocated — probable extraction error">⚠ DATA?</span> : null}
           </div>
-          <div style={{ color: "#4a7fa0", fontSize: 10, marginTop: 3 }}>
+          <div style={{ color: "#4a7fa0", fontSize: 10, marginTop: 3, wordBreak: "break-word" }}>
             {cert.support_reason || cert.data?.support_reason || "Not processed yet"}
           </div>
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end", flexShrink: 0 }}>
           <Badge status={cert.document_family || cert.data?.document_family || "unknown"} />
           {status ? <Badge status={status} /> : null}
           {cert.match?.match_method?.includes("widened") ? <Badge status="widened" /> : null}
@@ -5593,7 +5594,7 @@ export default function SAFManager({ onLogout, userEmail }) {
 
         {tab === "certs" ? (
           <>
-            <div style={{ width: 320, borderRight: "1px solid #0d2040", overflowY: "auto", padding: 12 }}>
+            <div style={{ width: 380, borderRight: "1px solid #0d2040", overflowY: "auto", padding: 12 }}>
               {!certs.length ? (
                 <div style={{ padding: "40px 20px", textAlign: "center", color: "#4a7fa0" }}>
                   <div style={{ fontSize: 36, marginBottom: 12 }}>✈</div>
