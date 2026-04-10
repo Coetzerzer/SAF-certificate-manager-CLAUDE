@@ -605,16 +605,24 @@ function releaseRowAllocation(row, amount) {
   row.validation_note = next.validationNote;
 }
 
-function hydrateInvoiceRowsWithAllocations(rows, links) {
+function hydrateInvoiceRowsWithAllocations(rows, links, certs) {
   const totalsByRowId = new Map();
+  const certsByRowId = new Map();
   for (const link of links || []) {
     const existing = totalsByRowId.get(link.invoice_row_id) || 0;
     totalsByRowId.set(link.invoice_row_id, Number((existing + Number(link.allocated_m3 || 0)).toFixed(6)));
+    const existingCerts = certsByRowId.get(link.invoice_row_id) || [];
+    if (!existingCerts.includes(link.certificate_id)) existingCerts.push(link.certificate_id);
+    certsByRowId.set(link.invoice_row_id, existingCerts);
   }
+
+  const certById = new Map((certs || []).map((c) => [c.id, c]));
 
   return (rows || []).map((row) => {
     const allocated = totalsByRowId.get(row.id) || 0;
     const summary = summarizeInvoiceRowState(row, allocated);
+    const linkedCertIds = certsByRowId.get(row.id) || [];
+    const linkedCertNumbers = linkedCertIds.map((id) => certById.get(id)?.unique_number || id).filter(Boolean);
     return {
       ...row,
       allocated_m3_total: summary.allocatedTotal,
@@ -622,6 +630,8 @@ function hydrateInvoiceRowsWithAllocations(rows, links) {
       is_allocated: summary.isAllocated,
       allocation_status: summary.status,
       validation_note: summary.validationNote,
+      linked_cert_ids: linkedCertIds,
+      linked_cert_numbers: linkedCertNumbers,
     };
   });
 }
@@ -2770,6 +2780,7 @@ function Badge({ status }) {
     free: ["#4a9fd4", "#061423"],
     duplicate: ["#ffbb00", "#1a1200"],
     invalid: ["#ff6666", "#1a0000"],
+    widened: ["#ff9933", "#1a0d00"],
   };
   const key = label.toLowerCase().replace(/\s+/g, "_");
   const [fg, bg] = map[key] || ["#c8dff0", "#0a1628"];
@@ -2873,6 +2884,371 @@ function MatchRowsTable({ rows, title = "LINKED INVOICE ROWS", emptyText = "No l
   );
 }
 
+function buildDashboardData(certs, invoiceRows) {
+  const grid = {};
+  const airports = new Set();
+  const months = new Set();
+  let totalCertVolume = 0;
+  let totalAllocated = 0;
+  const alerts = [];
+
+  for (const cert of certs) {
+    const match = cert.match;
+    if (!match) continue;
+
+    const certVol = Number(match.cert_volume_m3) || 0;
+    const allocVol = Number(match.allocated_volume_m3) || 0;
+    const status = match.status;
+
+    if (["auto_linked", "approved", "partial_linked", "unmatched"].includes(status)) {
+      totalCertVolume += certVol;
+      totalAllocated += allocVol;
+    }
+
+    const canonicalAirports = cert.data?.canonicalAirports || [];
+    const airportCode = canonicalAirports[0]?.iata || "???";
+    const month = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
+
+    if (airportCode === "???" || month === "???") continue;
+    airports.add(airportCode);
+    months.add(month);
+
+    const key = `${airportCode}|${month}`;
+    if (!grid[key]) grid[key] = { certVolume: 0, allocatedVolume: 0, certs: [], worstStatus: null };
+    grid[key].certVolume += certVol;
+    grid[key].allocatedVolume += allocVol;
+    grid[key].certs.push(cert);
+
+    const statusRank = { unmatched: 3, partial_linked: 2, manual_only: 1, auto_linked: 0, approved: 0 };
+    if (grid[key].worstStatus === null || (statusRank[status] || 0) > (statusRank[grid[key].worstStatus] || 0)) {
+      grid[key].worstStatus = status;
+    }
+
+    // Alerts
+    if (certVol > 50) {
+      alerts.push({ type: "volume", cert, message: `${airportCode} ${month}: volume ${certVol.toFixed(1)} m³ exceeds plausibility threshold` });
+    }
+    if (status === "partial_linked" && certVol > 0 && allocVol / certVol < 0.10 && !match.match_method?.includes("widened")) {
+      alerts.push({ type: "gap", cert, message: `${airportCode} ${month}: only ${(allocVol / certVol * 100).toFixed(1)}% allocated — probable extraction error` });
+    }
+    if (status === "unmatched") {
+      const totalRows = Number(match.diagnostics?.total_row_count) || 0;
+      alerts.push({
+        type: "unmatched", cert,
+        message: totalRows > 0
+          ? `${airportCode} ${month}: ${totalRows} invoice rows found but all SAF volume consumed by other certs`
+          : `${airportCode} ${month}: no invoice rows found for this airport/month`
+      });
+    }
+    if (status === "manual_only" && cert.document_family === "manual_only") {
+      alerts.push({ type: "manual", cert, message: `${cert.unique_number?.slice(-20) || "?"}: ${cert.classification_reason || "requires manual review"}` });
+    }
+  }
+
+  return {
+    grid,
+    airports: [...airports].sort(),
+    months: [...months].sort(),
+    totalCertVolume,
+    totalAllocated,
+    gap: totalCertVolume - totalAllocated,
+    coveragePercent: totalCertVolume > 0 ? (totalAllocated / totalCertVolume) * 100 : 0,
+    certsOk: certs.filter((c) => c.match?.status === "approved").length,
+    certsAttention: certs.filter((c) => ["partial_linked", "unmatched", "manual_only"].includes(c.match?.status)).length,
+    alerts,
+  };
+}
+
+function DashboardTab({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
+  const data = buildDashboardData(certs, invoiceRows);
+  const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  const fmtMonth = (m) => {
+    if (!/^\d{4}-\d{2}$/.test(m)) return m;
+    const [y, mo] = m.split("-");
+    return `${monthNames[Number(mo) - 1]} ${y.slice(2)}`;
+  };
+
+  const cellColor = (cell) => {
+    if (!cell) return { bg: "#0a1628", fg: "#334", label: "—" };
+    if (cell.worstStatus === "approved" || cell.worstStatus === "auto_linked") return { bg: "#001a0d", fg: "#00ff9d", label: "OK" };
+    if (cell.worstStatus === "partial_linked") return { bg: "#1a0d00", fg: "#ff9933", label: "PARTIAL" };
+    if (cell.worstStatus === "unmatched") return { bg: "#1a0000", fg: "#ff6666", label: "UNMATCHED" };
+    if (cell.worstStatus === "manual_only") return { bg: "#1a1200", fg: "#ffbb00", label: "MANUAL" };
+    return { bg: "#0a1628", fg: "#4a7fa0", label: "?" };
+  };
+
+  const kpiStyle = { flex: 1, padding: "12px 20px", borderRight: "1px solid #0d2040", textAlign: "center" };
+  const kpiVal = { fontFamily: "'Space Mono', monospace", fontSize: 20, fontWeight: 700 };
+  const kpiLabel = { color: "#4a7fa0", fontSize: 9, letterSpacing: 1, marginTop: 2 };
+
+  const covColor = data.coveragePercent >= 95 ? "#00ff9d" : data.coveragePercent >= 50 ? "#ff9933" : "#ff6666";
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+      {/* KPIs */}
+      <div style={{ display: "flex", gap: 1, background: "#030d1a", borderRadius: 8, border: "1px solid #0d2040", marginBottom: 24, overflow: "hidden" }}>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00bfff" }}>{data.totalCertVolume.toFixed(2)}</div><div style={kpiLabel}>CERTIFIED M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00ff9d" }}>{data.totalAllocated.toFixed(2)}</div><div style={kpiLabel}>ALLOCATED M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: data.gap > 0.01 ? "#ff6666" : "#00ff9d" }}>{data.gap.toFixed(2)}</div><div style={kpiLabel}>GAP M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: covColor }}>{data.coveragePercent.toFixed(1)}%</div><div style={kpiLabel}>COVERAGE</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00ff9d" }}>{data.certsOk}</div><div style={kpiLabel}>CERTS OK</div></div>
+        <div style={{ ...kpiStyle, borderRight: "none" }}><div style={{ ...kpiVal, color: data.certsAttention > 0 ? "#ff9933" : "#00ff9d" }}>{data.certsAttention}</div><div style={kpiLabel}>NEED ATTENTION</div></div>
+      </div>
+
+      {/* Airport × Month Grid */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ color: "#00bfff", fontSize: 11, letterSpacing: 2, marginBottom: 12, fontFamily: "'Space Mono', monospace" }}>COVERAGE BY AIRPORT & MONTH</div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10, width: "100%" }}>
+            <thead>
+              <tr>
+                <th style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", borderBottom: "2px solid #0d3060" }}>AIRPORT</th>
+                {data.months.map((m) => <th key={m} style={{ padding: "8px 10px", textAlign: "center", color: "#00bfff", borderBottom: "2px solid #0d3060", whiteSpace: "nowrap" }}>{fmtMonth(m)}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {data.airports.map((airport) => (
+                <tr key={airport} style={{ borderBottom: "1px solid #0d2040" }}>
+                  <td style={{ padding: "8px 12px", color: "#e0f0ff", fontWeight: 600 }}>{airport}</td>
+                  {data.months.map((m) => {
+                    const cell = data.grid[`${airport}|${m}`];
+                    const { bg, fg, label } = cellColor(cell);
+                    return (
+                      <td key={m} style={{ padding: "6px 8px", textAlign: "center" }}
+                        title={cell ? `Cert: ${cell.certVolume.toFixed(3)} m³\nAllocated: ${cell.allocatedVolume.toFixed(3)} m³\nGap: ${(cell.certVolume - cell.allocatedVolume).toFixed(3)} m³` : "No certificate"}>
+                        <span style={{ display: "inline-block", padding: "3px 8px", borderRadius: 4, background: bg, color: fg, fontSize: 9, fontWeight: 700, minWidth: 50 }}>
+                          {cell ? `${cell.allocatedVolume.toFixed(2)}` : "—"}
+                        </span>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Alerts */}
+      {data.alerts.length > 0 && (
+        <div>
+          <div style={{ color: "#ff9933", fontSize: 11, letterSpacing: 2, marginBottom: 12, fontFamily: "'Space Mono', monospace" }}>ATTENTION REQUIRED ({data.alerts.length})</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {data.alerts.map((alert, i) => {
+              const iconMap = { volume: "⚠", gap: "📉", unmatched: "❌", manual: "🔧" };
+              const colorMap = { volume: "#ff9933", gap: "#ff9933", unmatched: "#ff6666", manual: "#ffbb00" };
+              return (
+                <div key={i}
+                  onClick={() => {
+                    if (alert.cert) {
+                      const idx = certs.indexOf(alert.cert);
+                      if (idx >= 0) { onSelectCert(idx); onSwitchTab("certs"); }
+                    }
+                  }}
+                  style={{
+                    padding: "8px 14px", background: "#060e1a", border: `1px solid ${colorMap[alert.type] || "#0d3060"}33`,
+                    borderLeft: `3px solid ${colorMap[alert.type] || "#0d3060"}`, borderRadius: 6, cursor: "pointer",
+                    color: "#c8dff0", fontSize: 11, fontFamily: "'Space Mono', monospace",
+                    transition: "background 0.15s",
+                  }}>
+                  <span style={{ marginRight: 8 }}>{iconMap[alert.type] || "•"}</span>
+                  <span style={{ color: colorMap[alert.type] || "#c8dff0" }}>{alert.message}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function exportInvoiceRowsCSV(rows) {
+  const headers = ["Status", "CSV Row", "Invoice", "Customer", "Uplift Date", "IATA", "ICAO", "Country", "Supplier", "Uplift M3", "SAF M3", "Remaining SAF M3", "Linked Certificate"];
+  const csvRows = [headers.join(",")];
+  for (const row of rows) {
+    const vals = [
+      row.allocation_status || "free",
+      row.row_number || "",
+      `"${(row.invoice_no || "").replace(/"/g, '""')}"`,
+      `"${(row.customer || "").replace(/"/g, '""')}"`,
+      row.uplift_date || "",
+      row.iata || "",
+      row.icao || "",
+      row.country || "",
+      `"${(row.supplier || "").replace(/"/g, '""')}"`,
+      row.vol_m3 || "",
+      row.saf_vol_m3 || "",
+      row.remaining_m3 ?? "",
+      `"${(row.linked_cert_numbers || []).join("; ")}"`,
+    ];
+    csvRows.push(vals.join(","));
+  }
+  const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `invoice_rows_export_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function buildCertDetailData(certs, invoiceRows) {
+  const getRowMonth = (row) => {
+    if (!row.uplift_date) return null;
+    const d = new Date(row.uplift_date);
+    if (isNaN(d)) return null;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  };
+  const invoicePools = new Map();
+  for (const row of invoiceRows || []) {
+    const key = `${(row.iata || "").toUpperCase()}|${getRowMonth(row)}`;
+    const pool = invoicePools.get(key) || { totalSaf: 0, rowCount: 0 };
+    pool.totalSaf += Number(row.saf_vol_m3) || 0;
+    pool.rowCount++;
+    invoicePools.set(key, pool);
+  }
+  const result = certs.map((cert) => {
+    const airport = cert.data?.canonicalAirports?.[0]?.iata || "???";
+    const month = cert.data?.coverageMonth || "???";
+    const pool = invoicePools.get(`${airport}|${month}`);
+    const certVol = Number(cert.match?.cert_volume_m3) || 0;
+    const allocVol = Number(cert.match?.allocated_volume_m3) || 0;
+    return {
+      airport, month,
+      supplier: cert.data?.safSupplier || "—",
+      uniqueNumber: cert.unique_number || "—",
+      docType: cert.data?.docType || "—",
+      rawMaterial: cert.data?.rawMaterial || "—",
+      certVolume: certVol,
+      invoiceSaf: pool?.totalSaf || 0,
+      invoiceRowCount: pool?.rowCount || 0,
+      allocated: allocVol,
+      gap: certVol - allocVol,
+      status: cert.match?.status || "no_match",
+      matchMethod: cert.match?.match_method || "—",
+      coverage: certVol > 0 ? (allocVol / certVol) * 100 : 0,
+      cert,
+      isDuplicate: false,
+    };
+  }).sort((a, b) => a.airport.localeCompare(b.airport) || a.month.localeCompare(b.month) || b.gap - a.gap);
+
+  // Mark exact duplicates: same airport + month + volume
+  const seen = new Map();
+  for (const row of result) {
+    const dupKey = `${row.airport}|${row.month}|${row.certVolume.toFixed(3)}`;
+    if (seen.has(dupKey)) {
+      row.isDuplicate = true;
+      seen.get(dupKey).isDuplicate = true;
+    } else {
+      seen.set(dupKey, row);
+    }
+  }
+
+  return result;
+}
+
+function exportCertDetailCSV(rows) {
+  const headers = ["Airport", "Month", "Supplier", "Certificate", "Doc Type", "Raw Material", "Cert Volume M3", "Invoice SAF M3", "Invoice Rows", "Allocated M3", "Gap M3", "Coverage %", "Status", "Match Method"];
+  const csvRows = [headers.join(",")];
+  for (const r of rows) {
+    csvRows.push([r.airport, r.month, `"${(r.supplier || "").replace(/"/g, '""')}"`, `"${r.uniqueNumber}"`, r.docType, `"${r.rawMaterial}"`, r.certVolume.toFixed(3), r.invoiceSaf.toFixed(3), r.invoiceRowCount, r.allocated.toFixed(3), r.gap.toFixed(3), r.coverage.toFixed(1), r.status, r.matchMethod].join(","));
+  }
+  const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `saf_cert_detail_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function CertDetailTable({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
+  const [airportFilter, setAirportFilter] = React.useState("");
+  const [monthFilter, setMonthFilter] = React.useState("");
+  const [statusFilter, setStatusFilter] = React.useState("");
+  const allRows = buildCertDetailData(certs, invoiceRows);
+  const filtered = allRows.filter((r) => {
+    if (airportFilter && r.airport !== airportFilter) return false;
+    if (monthFilter && r.month !== monthFilter) return false;
+    if (statusFilter && r.status !== statusFilter) return false;
+    return true;
+  });
+  const uniqueAirports = [...new Set(allRows.map((r) => r.airport).filter((a) => a !== "???"))].sort();
+  const uniqueMonths = [...new Set(allRows.map((r) => r.month).filter((m) => m !== "???"))].sort();
+  const uniqueStatuses = [...new Set(allRows.map((r) => r.status))].sort();
+  const totals = filtered.reduce((acc, r) => ({ certVol: acc.certVol + r.certVolume, invoiceSaf: acc.invoiceSaf + r.invoiceSaf, alloc: acc.alloc + r.allocated, gap: acc.gap + r.gap }), { certVol: 0, invoiceSaf: 0, alloc: 0, gap: 0 });
+  const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+  const fmtMonth = (m) => { if (!/^\d{4}-\d{2}$/.test(m)) return m; const [y, mo] = m.split("-"); return `${monthNames[Number(mo) - 1]} ${y.slice(2)}`; };
+  const selectStyle = { background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace" };
+  const statusColor = (s) => ({ approved: "#00ff9d", auto_linked: "#00ff9d", partial_linked: "#ff9933", unmatched: "#ff6666", manual_only: "#ffbb00" }[s] || "#4a7fa0");
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 16, flexWrap: "wrap", fontFamily: "'Space Mono', monospace", fontSize: 11 }}>
+        <select value={airportFilter} onChange={(e) => setAirportFilter(e.target.value)} style={selectStyle}>
+          <option value="">All airports</option>
+          {uniqueAirports.map((a) => <option key={a} value={a}>{a}</option>)}
+        </select>
+        <select value={monthFilter} onChange={(e) => setMonthFilter(e.target.value)} style={selectStyle}>
+          <option value="">All months</option>
+          {uniqueMonths.map((m) => <option key={m} value={m}>{fmtMonth(m)}</option>)}
+        </select>
+        <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={selectStyle}>
+          <option value="">All statuses</option>
+          {uniqueStatuses.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <button className="btn" onClick={() => exportCertDetailCSV(filtered)} style={{ background: "#0a1628", color: "#00bfff", padding: "5px 12px", borderRadius: 5, fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 1, border: "1px solid #0d3060", cursor: "pointer" }}>EXPORT CSV</button>
+        <span style={{ color: "#4a7fa0", marginLeft: "auto" }}>Showing <span style={{ color: "#00bfff" }}>{filtered.length}</span> of <span style={{ color: "#00bfff" }}>{allRows.length}</span> certs</span>
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+          <thead>
+            <tr style={{ borderBottom: "2px solid #0d3060" }}>
+              {["AIRPORT", "MONTH", "SUPPLIER", "CERTIFICATE", "TYPE", "MATERIAL", "CERT M³", "INV SAF M³", "ROWS", "ALLOC M³", "GAP M³", "COV %", "STATUS", "METHOD"].map((h) => (
+                <th key={h} style={{ padding: "8px 8px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((r, i) => (
+              <tr key={`${r.uniqueNumber}-${i}`} onClick={() => { const idx = certs.indexOf(r.cert); if (idx >= 0) { onSelectCert(idx); onSwitchTab("certs"); } }}
+                style={{ borderBottom: "1px solid #0d2040", background: r.isDuplicate ? "#1a0a0a" : (i % 2 === 0 ? "#060e1a" : "#030d1a"), cursor: "pointer", borderLeft: `3px solid ${r.isDuplicate ? "#ff4444" : statusColor(r.status)}` }}>
+                <td style={{ padding: "6px 8px", color: "#e0f0ff", fontWeight: 600 }}>{r.airport}{r.isDuplicate ? <span style={{ color: "#ff4444", fontSize: 9, marginLeft: 4, fontWeight: 700 }} title="Exact duplicate: same airport + month + volume as another certificate">DUP</span> : null}</td>
+                <td style={{ padding: "6px 8px", color: "#c8dff0" }}>{fmtMonth(r.month)}</td>
+                <td style={{ padding: "6px 8px", color: "#888", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.supplier}>{r.supplier}</td>
+                <td style={{ padding: "6px 8px", color: "#00bfff", maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.uniqueNumber}>{r.uniqueNumber.slice(-18)}</td>
+                <td style={{ padding: "6px 8px", color: "#888" }}>{r.docType}</td>
+                <td style={{ padding: "6px 8px", color: "#888", maxWidth: 80, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.rawMaterial}>{r.rawMaterial}</td>
+                <td style={{ padding: "6px 8px", color: "#e0f0ff", fontWeight: 700 }}>{r.certVolume.toFixed(3)}</td>
+                <td style={{ padding: "6px 8px", color: "#4a9fd4" }}>{r.invoiceSaf.toFixed(3)}</td>
+                <td style={{ padding: "6px 8px", color: "#888" }}>{r.invoiceRowCount}</td>
+                <td style={{ padding: "6px 8px", color: "#00ff9d", fontWeight: 700 }}>{r.allocated.toFixed(3)}</td>
+                <td style={{ padding: "6px 8px", color: r.gap > 0.001 ? "#ff6666" : "#00ff9d", fontWeight: 700 }}>{r.gap.toFixed(3)}</td>
+                <td style={{ padding: "6px 8px", color: r.coverage >= 95 ? "#00ff9d" : r.coverage >= 50 ? "#ff9933" : "#ff6666" }}>{r.coverage.toFixed(0)}%</td>
+                <td style={{ padding: "6px 8px" }}><Badge status={r.status} /></td>
+                <td style={{ padding: "6px 8px", color: r.matchMethod.includes("widened") ? "#ff9933" : "#888", fontSize: 9 }}>{r.matchMethod.includes("widened") ? "WIDENED" : r.matchMethod === "fifo-monthly-partial" ? "MONTH" : r.matchMethod === "fifo-quarterly-partial" ? "QUARTER" : r.matchMethod.split("-")[0] || "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr style={{ borderTop: "2px solid #0d3060", background: "#0a1628" }}>
+              <td colSpan={6} style={{ padding: "8px 8px", color: "#00bfff", fontWeight: 700 }}>TOTALS ({filtered.length} certs)</td>
+              <td style={{ padding: "8px 8px", color: "#e0f0ff", fontWeight: 700 }}>{totals.certVol.toFixed(3)}</td>
+              <td style={{ padding: "8px 8px", color: "#4a9fd4" }}>{totals.invoiceSaf.toFixed(3)}</td>
+              <td style={{ padding: "8px 8px" }}></td>
+              <td style={{ padding: "8px 8px", color: "#00ff9d", fontWeight: 700 }}>{totals.alloc.toFixed(3)}</td>
+              <td style={{ padding: "8px 8px", color: totals.gap > 0.001 ? "#ff6666" : "#00ff9d", fontWeight: 700 }}>{totals.gap.toFixed(3)}</td>
+              <td style={{ padding: "8px 8px", color: totals.certVol > 0 ? (totals.alloc / totals.certVol * 100 >= 95 ? "#00ff9d" : "#ff9933") : "#888" }}>{totals.certVol > 0 ? (totals.alloc / totals.certVol * 100).toFixed(0) : 0}%</td>
+              <td colSpan={2}></td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onOpenPdf, hasClientCert }) {
   const status = cert.match?.status;
   const isCompleted = status === "approved" && hasClientCert;
@@ -2931,7 +3307,8 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
           )}
           <div style={{ color: "#4a7fa0", fontSize: 11, marginTop: 3 }}>
             {formatVolume(cert.data?.quantity)} {cert.data?.quantityUnit || "m3"}
-            {Number(cert.data?.quantity) > 50 ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Volume exceeds plausibility threshold — likely a number format error">⚠ VOLUME?</span> : null}
+            {Number(cert.data?.quantity) > 50 ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Volume exceeds 50 m³ — verify PDF extraction. This is likely a number format error.">⚠ VOLUME?</span> : null}
+            {cert.match?.status === "partial_linked" && Number(cert.match?.cert_volume_m3) > 0 && Number(cert.match?.allocated_volume_m3) / Number(cert.match?.cert_volume_m3) < 0.10 && !cert.match?.match_method?.includes("widened") ? <span style={{ color: "#ff9933", marginLeft: 6, fontSize: 9, fontWeight: 700 }} title="Only a fraction of the volume was allocated — probable extraction error">⚠ DATA?</span> : null}
           </div>
           <div style={{ color: "#4a7fa0", fontSize: 10, marginTop: 3 }}>
             {cert.support_reason || cert.data?.support_reason || "Not processed yet"}
@@ -2940,6 +3317,7 @@ function CertCard({ cert, index, selected, onSelect, onAnalyze, onReExtract, onO
         <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end" }}>
           <Badge status={cert.document_family || cert.data?.document_family || "unknown"} />
           {status ? <Badge status={status} /> : null}
+          {cert.match?.match_method?.includes("widened") ? <Badge status="widened" /> : null}
           {isCompleted ? (
             <span style={{ color: "#00ff9d", fontSize: 10, fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>✓ DONE</span>
           ) : (
@@ -3733,7 +4111,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (hydratedUnits.length) unitsByCertId.set(row.id, hydratedUnits);
       }
 
-      const hydratedInvoiceRows = hydrateInvoiceRowsWithAllocations(invoiceRowsData, linkRes.data || []);
+      const hydratedInvoiceRows = hydrateInvoiceRowsWithAllocations(invoiceRowsData, linkRes.data || [], normalizedCertRows);
 
       const matchByCertId = new Map(
         (matchRes.data || []).map((match) => [
@@ -3959,6 +4337,24 @@ export default function SAFManager({ onLogout, userEmail }) {
             .from("certificates-pdf")
             .upload(storagePath, file, { contentType: "application/pdf", upsert: true });
           if (storageErr) addLog(`PDF storage warning for ${file.name}: ${storageErr.message}`, "error");
+
+          // Duplicate detection: same airport + month + volume = likely duplicate
+          const newAirport = parsed.canonicalAirports?.[0]?.iata || "";
+          const newMonth = parsed.coverageMonth || "";
+          const newVolume = Number(parsed.quantity) || 0;
+          if (newAirport && newMonth && newVolume > 0) {
+            const existingDup = certs.find((c) => {
+              if (uniqueNumber && c.unique_number === uniqueNumber) return false; // same cert being re-uploaded, not a dup
+              const cAirport = c.data?.canonicalAirports?.[0]?.iata || "";
+              const cMonth = c.data?.coverageMonth || "";
+              const cVolume = Number(c.data?.quantity) || 0;
+              return cAirport === newAirport && cMonth === newMonth && Math.abs(cVolume - newVolume) < 0.001;
+            });
+            if (existingDup) {
+              addLog(`⚠ DUPLICATE DETECTED: ${file.name} matches existing cert ${existingDup.unique_number || existingDup.filename} (${newAirport} ${newMonth} ${newVolume} m³). Skipping.`, "error");
+              continue;
+            }
+          }
 
           const baseCertificatePayload = {
             filename: file.name,
@@ -5163,6 +5559,8 @@ export default function SAFManager({ onLogout, userEmail }) {
 
       <div style={{ display: "flex", borderBottom: "1px solid #0d2040", background: "#030d1a" }}>
         {[
+          ["dashboard", "DASHBOARD"],
+          ["certDetail", "SAF DATA"],
           ["certs", "CERTIFICATES"],
           ["clientCerts", "CLIENT CERTIFICATES"],
           ["coverage", "COVERAGE"],
@@ -5185,6 +5583,14 @@ export default function SAFManager({ onLogout, userEmail }) {
       </div>
 
       <div style={{ display: "flex", flex: 1, overflow: "hidden", height: "calc(100vh - 220px)" }}>
+        {tab === "dashboard" ? (
+          <DashboardTab certs={certs} invoiceRows={invoiceRows} onSelectCert={setSelected} onSwitchTab={setTab} />
+        ) : null}
+
+        {tab === "certDetail" ? (
+          <CertDetailTable certs={certs} invoiceRows={invoiceRows} onSelectCert={setSelected} onSwitchTab={setTab} />
+        ) : null}
+
         {tab === "certs" ? (
           <>
             <div style={{ width: 320, borderRight: "1px solid #0d2040", overflowY: "auto", padding: 12 }}>
@@ -5333,6 +5739,24 @@ export default function SAFManager({ onLogout, userEmail }) {
                       {selectedCert.match ? <Badge status={selectedCert.match.status} /> : null}
                     </div>
                   </div>
+
+                  {/* Alert banners for suspect data */}
+                  {Number(selectedCert.match?.cert_volume_m3 ?? selectedCert.data?.quantity) > 50 && (
+                    <div style={{ padding: "10px 14px", background: "#1a0d00", border: "1px solid #ff993344", borderLeft: "3px solid #ff9933", borderRadius: 6, marginBottom: 12, fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#ff9933" }}>
+                      ⚠ Volume exceeds 50 m³ ({Number(selectedCert.match?.cert_volume_m3 ?? selectedCert.data?.quantity).toFixed(1)} m³). This likely indicates a number format error during PDF extraction. Consider re-extracting this certificate.
+                    </div>
+                  )}
+                  {selectedCert.match?.status === "partial_linked" && Number(selectedCert.match?.cert_volume_m3) > 0 && Number(selectedCert.match?.allocated_volume_m3) / Number(selectedCert.match?.cert_volume_m3) < 0.10 && !selectedCert.match?.match_method?.includes("widened") && (
+                    <div style={{ padding: "10px 14px", background: "#1a0d00", border: "1px solid #ff993344", borderLeft: "3px solid #ff9933", borderRadius: 6, marginBottom: 12, fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#ff9933" }}>
+                      📉 Only {(Number(selectedCert.match?.allocated_volume_m3) / Number(selectedCert.match?.cert_volume_m3) * 100).toFixed(1)}% of the volume was allocated. This strongly suggests an extraction error rather than missing invoice data.
+                    </div>
+                  )}
+                  {selectedCert.match?.diagnostics?.widened && (
+                    <div style={{ padding: "10px 14px", background: "#061423", border: "1px solid #00bfff33", borderLeft: "3px solid #00bfff", borderRadius: 6, marginBottom: 12, fontFamily: "'Space Mono', monospace", fontSize: 11, color: "#c8dff0" }}>
+                      📅 Allocation widened from <span style={{ color: "#00bfff" }}>{selectedCert.match.diagnostics.original_period_start} – {selectedCert.match.diagnostics.original_period_end}</span> to <span style={{ color: "#00bfff" }}>{selectedCert.match.diagnostics.widened_period_start} – {selectedCert.match.diagnostics.widened_period_end}</span> (quarter).
+                      {selectedCert.match.diagnostics.widen_candidate_count > 0 ? ` ${selectedCert.match.diagnostics.widen_candidate_count} additional rows from neighboring months.` : ""}
+                    </div>
+                  )}
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
                     <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
@@ -5678,6 +6102,16 @@ export default function SAFManager({ onLogout, userEmail }) {
                     </select>
                     <input type="text" placeholder="Search customer or invoice..." value={invoiceCustomerSearch} onChange={(e) => setInvoiceCustomerSearch(e.target.value)}
                       style={{ background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace", width: 220 }} />
+                    <button
+                      className="btn"
+                      onClick={() => exportInvoiceRowsCSV(filteredRows)}
+                      style={{
+                        background: "#0a1628", color: "#00bfff", padding: "5px 12px", borderRadius: 5,
+                        fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 1,
+                        border: "1px solid #0d3060", cursor: "pointer",
+                      }}>
+                      EXPORT CSV
+                    </button>
                     <span style={{ color: "#4a7fa0", marginLeft: "auto" }}>
                       Showing <span style={{ color: "#00bfff" }}>{filteredRows.length}</span> of <span style={{ color: "#00bfff" }}>{invoiceRows.length}</span> rows
                     </span>
@@ -5686,7 +6120,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                     <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
                       <thead>
                         <tr style={{ borderBottom: "2px solid #0d3060" }}>
-                          {["STATUS", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3"].map(
+                          {["STATUS", "LINKED CERT", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3"].map(
                             (header) => (
                               <th key={header} style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
                                 {header}
@@ -5700,6 +6134,25 @@ export default function SAFManager({ onLogout, userEmail }) {
                           <tr key={row.id || index} className="invoice-row" style={{ borderBottom: "1px solid #0d2040", background: index % 2 === 0 ? "#060e1a" : "#030d1a", transition: "background 0.15s" }}>
                             <td style={{ padding: "7px 12px" }}>
                               <Badge status={row.allocation_status || (row.is_allocated ? "allocated" : "free")} />
+                            </td>
+                            <td style={{ padding: "7px 12px" }}>
+                              {(row.linked_cert_numbers || []).length > 0 ? (
+                                <button
+                                  className="btn"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const certId = row.linked_cert_ids?.[0];
+                                    if (certId) {
+                                      const idx = certs.findIndex((c) => c.id === certId);
+                                      if (idx >= 0) { setSelected(idx); setTab("certs"); }
+                                    }
+                                  }}
+                                  style={{ background: "none", color: "#00bfff", fontSize: 9, padding: 0, textDecoration: "underline", textUnderlineOffset: 2, cursor: "pointer", fontFamily: "'Space Mono', monospace", border: "none", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}
+                                  title={(row.linked_cert_numbers || []).join("\n")}
+                                >
+                                  {row.linked_cert_numbers[0]?.slice(-15) || "—"}
+                                </button>
+                              ) : <span style={{ color: "#334", fontSize: 9 }}>—</span>}
                             </td>
                             <td style={{ padding: "7px 12px", color: "#4a9fd4" }}>{row.row_number}</td>
                             <td style={{ padding: "7px 12px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
