@@ -106,6 +106,18 @@ IMPORTANT RULES:
 - NUMBERS: always use a dot "." as the decimal separator, never a comma. E.g. write 5.599 not 5,599 — even if the source document uses European comma-decimal formatting.
 - QUANTITY vs ENERGY — THIS IS CRITICAL: The PDF typically has a "Quantity" row (with m3/15°C, litres, MT, kg) and a separate "Energy content" row (with MJ). You MUST map the VOLUME from the "Quantity" row into the "quantity" JSON field, and the MJ value from the "Energy content" row into the "energyContent" JSON field. Do NOT swap them. Self-check: if your "quantity" value is in MJ or your "energyContent" is in m3, you have them backwards — fix it. For SAF, energy content in MJ is typically much larger than volume in m3 (roughly 33,000 MJ per m3).
 - CRITICAL NUMBER RULE: In European documents, a comma is ALWAYS a decimal separator, NEVER a thousands separator. European documents use spaces or dots for thousands grouping. So "2,080" means 2.080 (about two), "43,115" means 43.115 (about forty-three), "2 328,388" means 2328.388. Never interpret a comma as a thousands separator in these documents. When in doubt, check if the numeric magnitude makes sense in context (SAF volumes are typically 0.1–500 m3, not thousands).
+- TOTALENERGIES PoC FORMAT: Some PoC documents (especially from TotalEnergies) contain TWO separate tables:
+  (a) "JET A-1 Sales" — airports where fuel was sold to the customer. The SAF certificate covers ALL these airports.
+  (b) "SAF Delivery site" — where SAF was physically blended and in which month(s).
+  When both tables exist:
+  - "deliveryAirports": list ALL airports from BOTH tables (all are covered by the SAF).
+  - "physicalDeliveryAirport": use the airport from "SAF Delivery site".
+  - "quantity": use BioQuantity (total SAF volume from the SAF Delivery site total).
+  - "totalVolume": use Volumes M3 (total JET A-1 from JET A-1 Sales total).
+  - CRITICAL for coverageMonth: use the month(s) with non-zero volume in the "SAF Delivery site" table, NOT the full supply period. If SAF was delivered in multiple months, set coverageMonth to the month with the LARGEST volume. Put the full supply period in "supplyPeriod" only.
+  - "coverageStart"/"coverageEnd": set to the first/last day of the SAF delivery month (from coverageMonth), NOT the full supply period.
+  - "monthlyVolumes": populate from the "JET A-1 Sales" table rows (this shows the fuel coverage breakdown by airport and month).
+  - "isComplexPoC": "true" if JET A-1 Sales has 3+ airports.
 - Return ONLY the JSON, no markdown, no explanation.`;
 
 function jsonResponse(body: unknown, status = 200) {
@@ -191,7 +203,7 @@ Deno.serve(async (req) => {
       headers: {
         "Content-Type": "application/json",
         "x-api-key": apiKey,
-        "anthropic-version": "2024-10-22",
+        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,

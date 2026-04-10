@@ -394,21 +394,26 @@ function deriveSimpleMonthCoverage(data, context = {}) {
     }
   }
 
-  const supplyPeriod = parseRangeFromValue(data?.supplyPeriod);
-  if (supplyPeriod) {
-    if (formatYearMonth(supplyPeriod.start) === formatYearMonth(supplyPeriod.end)) {
-      addCandidate(formatYearMonth(supplyPeriod.start), "supply-period", "single-month-supply-period");
-    } else {
-      return {
-        coverageGranularity: "period",
-        coverageMonth: "",
-        coverageStart: toISODate(supplyPeriod.start),
-        coverageEnd: toISODate(supplyPeriod.end),
-        coverageSource: "supply-period",
-        matchingEvidence: "multi-month-supply-period",
-        isAmbiguous: true,
-        ambiguityReason: "supply period covers more than one month",
-      };
+  // Only fall back to supplyPeriod if no coverage candidates found yet.
+  // This prevents an annual supply period (e.g. Jan-Dec) from overriding
+  // a specific coverageMonth already extracted (e.g. from SAF Delivery site).
+  if (monthCandidates.length === 0) {
+    const supplyPeriod = parseRangeFromValue(data?.supplyPeriod);
+    if (supplyPeriod) {
+      if (formatYearMonth(supplyPeriod.start) === formatYearMonth(supplyPeriod.end)) {
+        addCandidate(formatYearMonth(supplyPeriod.start), "supply-period", "single-month-supply-period");
+      } else {
+        return {
+          coverageGranularity: "period",
+          coverageMonth: "",
+          coverageStart: toISODate(supplyPeriod.start),
+          coverageEnd: toISODate(supplyPeriod.end),
+          coverageSource: "supply-period",
+          matchingEvidence: "multi-month-supply-period",
+          isAmbiguous: true,
+          ambiguityReason: "supply period covers more than one month",
+        };
+      }
     }
   }
 
@@ -546,7 +551,8 @@ export function deriveCertificateClassification(data, context = {}) {
   else if (quantity > 50) rejectionReasons.push(`SAF volume ${quantity} m³ exceeds plausibility threshold — likely a number format error`);
   if (isNonM3Unit(data?.quantityUnit)) rejectionReasons.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
   if (hasComplexMonthlyTable || hasComplexAirportTable) rejectionReasons.push("complex tables are present");
-  if (underlyingPoSCount > 1) rejectionReasons.push("multiple underlying certificates are present");
+  // Multiple underlying PoS is normal for PoC certificates — only reject for PoS documents
+  if (underlyingPoSCount > 1 && certKind !== "poc") rejectionReasons.push("multiple underlying certificates are present");
   if (annualTextHint) rejectionReasons.push("annual coverage was detected");
 
   if (rejectionReasons.length) {

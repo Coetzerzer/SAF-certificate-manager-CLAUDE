@@ -1644,7 +1644,8 @@ async function extractCertificateFromBase64(base64, filename) {
   });
 
   if (error) {
-    throw new Error(error.message || "Edge function invocation failed.");
+    const detail = data?.error || data?.details?.error?.message || "";
+    throw new Error(detail || error.message || "Edge function invocation failed.");
   }
   if (!data?.parsed) {
     throw new Error(data?.error || "Extraction function returned no parsed certificate.");
@@ -4920,6 +4921,33 @@ export default function SAFManager({ onLogout, userEmail }) {
     [addLog, loadFromDB, userEmail]
   );
 
+  const approveManual = useCallback(
+    async (cert) => {
+      setLoading(`Approving manual cert ${certTitle(cert)}...`);
+      try {
+        const { error } = await supabase
+          .from("certificate_matches")
+          .update({
+            status: "approved",
+            reviewed_by: userEmail || null,
+            reviewed_at: new Date().toISOString(),
+            review_note: "Manually reviewed and approved — no automated allocation performed.",
+            updated_at: new Date().toISOString(),
+          })
+          .eq("certificate_id", cert.id)
+          .eq("status", "manual_only");
+        if (error) throw error;
+        addLog(`Manually approved ${certTitle(cert)}`, "success");
+        await loadFromDB();
+      } catch (err) {
+        addLog(`Manual approval failed: ${err.message}`, "error");
+      } finally {
+        setLoading("");
+      }
+    },
+    [addLog, loadFromDB, userEmail]
+  );
+
   const bulkApproveAndGenerate = useCallback(
     async () => {
       const autoLinked = certs.filter((c) => c.match?.status === "auto_linked");
@@ -5935,6 +5963,60 @@ export default function SAFManager({ onLogout, userEmail }) {
                           {selectedCert.match?.status === "partial_linked"
                             ? `Partial match: ${Number(selectedCert.match?.allocated_volume_m3 || 0).toFixed(3)} m³ allocated / ${Number(selectedCert.match?.cert_volume_m3 || 0).toFixed(3)} m³ needed (gap: ${Number(selectedCert.match?.variance_m3 || 0).toFixed(3)} m³). Approve to accept partial allocation.`
                             : "This certificate was auto-linked by the FIFO algorithm. Approve to enable client certificate generation."}
+                        </span>
+                      </div>
+                    ) : null}
+
+                    {selectedCert.match?.status === "manual_only" ? (
+                      <div
+                        style={{
+                          gridColumn: "1 / -1",
+                          display: "flex",
+                          gap: 12,
+                          alignItems: "center",
+                          padding: 12,
+                          background: "#1a1200",
+                          borderRadius: 8,
+                          border: "1px solid #ffbb0033",
+                        }}
+                      >
+                        <button
+                          className="btn"
+                          onClick={() => approveManual(selectedCert)}
+                          disabled={!!loading}
+                          style={{
+                            background: "linear-gradient(135deg,#006633,#00ff9d)",
+                            color: "#000",
+                            padding: "8px 20px",
+                            borderRadius: 6,
+                            fontFamily: "'Space Mono', monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: 1,
+                          }}
+                        >
+                          APPROVE (MANUAL REVIEW)
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => rejectMatch(selectedCert)}
+                          disabled={!!loading}
+                          style={{
+                            background: "#1a0000",
+                            color: "#ff6666",
+                            padding: "8px 20px",
+                            borderRadius: 6,
+                            fontFamily: "'Space Mono', monospace",
+                            fontSize: 11,
+                            fontWeight: 700,
+                            letterSpacing: 1,
+                            border: "1px solid #ff666644",
+                          }}
+                        >
+                          REJECT
+                        </button>
+                        <span style={{ color: "#ffbb00", fontSize: 10, fontFamily: "'Space Mono', monospace" }}>
+                          This certificate requires manual review. No automated allocation was performed.
                         </span>
                       </div>
                     ) : null}
