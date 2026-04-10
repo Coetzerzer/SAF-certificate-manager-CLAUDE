@@ -116,7 +116,7 @@ IMPORTANT RULES:
   - "totalVolume": use Volumes M3 (total JET A-1 from JET A-1 Sales total).
   - CRITICAL for coverageMonth: use the month(s) with non-zero volume in the "SAF Delivery site" table, NOT the full supply period. If SAF was delivered in multiple months, set coverageMonth to the month with the LARGEST volume. Put the full supply period in "supplyPeriod" only.
   - "coverageStart"/"coverageEnd": set to the first/last day of the SAF delivery month (from coverageMonth), NOT the full supply period.
-  - "monthlyVolumes": populate from the "JET A-1 Sales" table rows (this shows the fuel coverage breakdown by airport and month).
+  - "monthlyVolumes": For the "JET A-1 Sales" table, extract EVERY non-zero cell as a separate entry. Each row in the table has 12 month columns (Jan–Dec). For each airport AND each month that has a non-zero value, create one entry: { "month": "YYYY-MM", "airport": "IATA code", "quantity": "value from that cell", "quantityUnit": "m3" }. Example: if LIN has Jan=24.720 and Feb=39.107, create TWO entries: [{ "month":"2025-01", "airport":"LIN", "quantity":"24.720", "quantityUnit":"m3" }, { "month":"2025-02", "airport":"LIN", "quantity":"39.107", "quantityUnit":"m3" }]. IMPORTANT: Include ALL airport rows, even those displayed BELOW the TOTAL row in the table (some PoC documents place airports after the total line). Skip rows labeled "TOTAL". The volumes in this table are total JET A-1 volumes (not SAF) — extract them as-is, the system will normalize to SAF proportionally.
   - "isComplexPoC": "true" if JET A-1 Sales has 3+ airports.
 - Return ONLY the JSON, no markdown, no explanation.`;
 

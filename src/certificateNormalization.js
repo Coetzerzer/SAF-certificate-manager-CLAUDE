@@ -287,11 +287,32 @@ function buildPocMonthlyAirportUnits(data, airports, warnings) {
     return buildManualOnlyUnits(data, airports, warnings);
   }
 
+  // Detect if monthlyVolumes contain total JET A-1 volumes instead of SAF volumes.
+  // If their sum significantly exceeds the cert SAF total, normalize proportionally:
+  //   saf_airport = (jet_airport / jet_total) × cert_saf_total
+  // This handles TotalEnergies PoC format where the JET A-1 Sales table shows
+  // total fuel volumes per airport and the SAF is a blended fraction of that total.
+  const certSafTotal = parseFlexibleNumber(data?.quantity) || 0;
+  const rawQuantities = volumes.map((entry) => parseFlexibleNumber(entry?.quantity) || 0);
+  const rawSum = rawQuantities.reduce((acc, q) => acc + q, 0);
+  const PROPORTIONAL_THRESHOLD = 1.05; // allow 5% rounding headroom
+  const needsProportionalNormalization = certSafTotal > 0 && rawSum > certSafTotal * PROPORTIONAL_THRESHOLD;
+
+  if (needsProportionalNormalization) {
+    warnings.push(
+      `monthlyVolumes sum (${rawSum.toFixed(3)} m³) exceeds cert SAF total (${certSafTotal.toFixed(3)} m³) by more than 5%. ` +
+      `Applying proportional normalization: each airport SAF = (airport_volume / total_volume) × cert_SAF.`
+    );
+  }
+
   return volumes.map((entry, index) => {
     const iata = String(entry?.airportCanonical?.iata || "").toUpperCase();
     const icao = String(entry?.airportCanonical?.icao || "").toUpperCase();
     const airportLabel = entry?.airportCanonical?.label || entry?.airport || iata || icao || "";
-    const quantity = parseFlexibleNumber(entry?.quantity) || 0;
+    const rawQty = rawQuantities[index];
+    const safVolume = needsProportionalNormalization && rawSum > 0
+      ? Number(((rawQty / rawSum) * certSafTotal).toFixed(6))
+      : rawQty;
     const monthBounds = makeMonthBounds(entry?.month);
 
     if (!monthBounds.month) warnings.push(`Entry ${index}: could not parse month from "${entry?.month}".`);
@@ -307,13 +328,15 @@ function buildPocMonthlyAirportUnits(data, airports, warnings) {
       periodStart: monthBounds.start || data?.coverageStart || "",
       periodEnd: monthBounds.end || data?.coverageEnd || "",
       dispatchDate: data?.dateDispatch || "",
-      safVolume: quantity,
-      jetVolume: null,
+      safVolume,
+      jetVolume: needsProportionalNormalization ? rawQty : null,
       quantityUnit: data?.quantityUnit || "",
       source: "monthlyVolumes",
       sourceReference: data?.uniqueNumber || data?.filename || "certificate",
       matchingModeOverride: "poc_monthly_airport",
-      notes: `PoC per-airport monthly volume for ${iata || icao} ${monthBounds.month || ""}.`,
+      notes: needsProportionalNormalization
+        ? `PoC proportional SAF for ${iata || icao} ${monthBounds.month || ""}: ${safVolume.toFixed(3)} m³ (${((rawQty / rawSum) * 100).toFixed(1)}% of ${certSafTotal} m³ total).`
+        : `PoC per-airport monthly volume for ${iata || icao} ${monthBounds.month || ""}.`,
     });
   });
 }
