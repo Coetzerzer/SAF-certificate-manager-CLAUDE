@@ -2764,6 +2764,10 @@ function isSupportedSimpleCert(cert) {
   return (cert?.document_family || cert?.data?.document_family) === "supported_simple";
 }
 
+function isSupportedPocCert(cert) {
+  return (cert?.document_family || cert?.data?.document_family) === "supported_poc";
+}
+
 function Badge({ status }) {
   const label = String(status || "unknown");
   const map = {
@@ -4225,6 +4229,34 @@ export default function SAFManager({ onLogout, userEmail }) {
     [loadedInvoiceImportId, syncAllocationUnitConsumption, userEmail]
   );
 
+  const runDatabasePocAllocation = useCallback(
+    async (certificate) => {
+      const { data, error } = await supabase.rpc("allocate_poc_certificate", {
+        p_certificate_id: certificate.id,
+        p_import_id: loadedInvoiceImportId,
+        p_actor: userEmail || null,
+      });
+      if (error) throw error;
+
+      const result = data && typeof data === "object" ? data : {};
+      await syncAllocationUnitConsumption(certificate.id);
+
+      return {
+        status: result.status || "unmatched",
+        match_method: result.match_method || "fifo-poc-monthly-airport",
+        cert_volume_m3: normalizeVolumeNumber(result.cert_volume_m3),
+        allocated_volume_m3: normalizeVolumeNumber(result.allocated_volume_m3) || 0,
+        variance_m3: normalizeVolumeNumber(result.variance_m3),
+        review_note: "",
+        candidate_sets: [],
+        linked_rows: Array.isArray(result.linked_rows) ? result.linked_rows : [],
+        unit_breakdown: Array.isArray(result.unit_breakdown) ? result.unit_breakdown : [],
+        diagnostics: result.diagnostics && typeof result.diagnostics === "object" ? result.diagnostics : {},
+      };
+    },
+    [loadedInvoiceImportId, syncAllocationUnitConsumption, userEmail]
+  );
+
   const clearCertificateMatch = useCallback(async (certificateId) => {
     const { error: deleteErr } = await supabase.from("certificate_matches").delete().eq("certificate_id", certificateId);
     if (deleteErr && !isMissingTableError(deleteErr)) throw deleteErr;
@@ -4746,7 +4778,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     async (index) => {
       const cert = certs[index];
       if (!cert?.id) return;
-      if (isSupportedSimpleCert(cert)) {
+      if (isSupportedSimpleCert(cert) || isSupportedPocCert(cert)) {
         if (!invoiceRows.length) {
           addLog("No invoice rows are loaded. Import the invoice CSV before matching certificates.", "error");
           return;
@@ -4765,7 +4797,9 @@ export default function SAFManager({ onLogout, userEmail }) {
       addLog(`Matching ${certTitle(cert)}`, "info");
 
       try {
-        const result = await runDatabaseSimpleAllocation(cert);
+        const result = isSupportedPocCert(cert)
+          ? await runDatabasePocAllocation(cert)
+          : await runDatabaseSimpleAllocation(cert);
         addLog(
           `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
           result.status === "unmatched" ? "error" : result.status === "manual_only" ? "info" : "success"
@@ -4778,12 +4812,12 @@ export default function SAFManager({ onLogout, userEmail }) {
         addLog(`Matching failed for ${certTitle(cert)}: ${error.message}`, "error");
       }
     },
-    [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabaseSimpleAllocation]
+    [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation]
   );
 
   const analyzeAll = useCallback(async () => {
     if (!certs.length) return;
-    if (certs.some((cert) => isSupportedSimpleCert(cert))) {
+    if (certs.some((cert) => isSupportedSimpleCert(cert) || isSupportedPocCert(cert))) {
       if (!invoiceRows.length) {
         addLog("No invoice rows are loaded. Import the invoice CSV before matching certificates.", "error");
         return;
@@ -4808,7 +4842,9 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (cert.match?.status === "approved") continue;
         setLoading(`Matching ${index + 1}/${certs.length}: ${certTitle(cert)}`);
         try {
-          const result = await runDatabaseSimpleAllocation(cert);
+          const result = isSupportedPocCert(cert)
+            ? await runDatabasePocAllocation(cert)
+            : await runDatabaseSimpleAllocation(cert);
           addLog(
             `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
             result.status === "unmatched" ? "error" : result.status === "manual_only" || result.status === "partial_linked" ? "info" : "success"
@@ -4829,7 +4865,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     } finally {
       setLoading("");
     }
-  }, [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabaseSimpleAllocation]);
+  }, [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation]);
 
   const approveCandidate = useCallback(
     async (cert, candidateIndex) => {
@@ -5908,6 +5944,43 @@ export default function SAFManager({ onLogout, userEmail }) {
                         );
                       })() : null}
                     </div>
+
+                    {isSupportedPocCert(selectedCert) &&
+                      Array.isArray(selectedCert.match?.diagnostics?.unit_breakdown) &&
+                      selectedCert.match.diagnostics.unit_breakdown.length > 0 && (
+                        <div style={{ gridColumn: "1 / -1", background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040" }}>
+                          <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+                            PER-AIRPORT ALLOCATION BREAKDOWN ({selectedCert.match.diagnostics.unit_breakdown.length} airports)
+                          </div>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+                            <thead>
+                              <tr style={{ color: "#4a7fa0" }}>
+                                <th style={{ textAlign: "left", padding: "4px 8px" }}>AIRPORT</th>
+                                <th style={{ textAlign: "left", padding: "4px 8px" }}>PERIOD</th>
+                                <th style={{ textAlign: "right", padding: "4px 8px" }}>TARGET m³</th>
+                                <th style={{ textAlign: "right", padding: "4px 8px" }}>ALLOCATED m³</th>
+                                <th style={{ textAlign: "right", padding: "4px 8px" }}>ROWS</th>
+                                <th style={{ textAlign: "left", padding: "4px 8px" }}>STATUS</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {selectedCert.match.diagnostics.unit_breakdown.map((unit, i) => {
+                                const statusColor = unit.status === "auto_linked" ? "#00ff9d" : unit.status === "partial_linked" ? "#ff9933" : unit.status === "skipped" ? "#4a7fa0" : "#ff6666";
+                                return (
+                                  <tr key={i} style={{ borderTop: "1px solid #0d2040" }}>
+                                    <td style={{ padding: "4px 8px", color: "#e0f0ff" }}>{unit.airport_iata || unit.airport_icao || "—"}</td>
+                                    <td style={{ padding: "4px 8px", color: "#c8dff0" }}>{unit.period_start ? String(unit.period_start).slice(0, 7) : "—"}</td>
+                                    <td style={{ padding: "4px 8px", textAlign: "right", color: "#c8dff0" }}>{Number(unit.target_volume_m3 || 0).toFixed(3)}</td>
+                                    <td style={{ padding: "4px 8px", textAlign: "right", color: statusColor, fontWeight: 700 }}>{Number(unit.allocated_volume_m3 || 0).toFixed(3)}</td>
+                                    <td style={{ padding: "4px 8px", textAlign: "right", color: "#c8dff0" }}>{unit.linked_count ?? "—"}</td>
+                                    <td style={{ padding: "4px 8px", color: statusColor, letterSpacing: 0.5 }}>{(unit.status || "—").replace(/_/g, " ")}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                    )}
 
                     <div style={{ gridColumn: "1 / -1" }}>
                       <MatchRowsTable rows={selectedCert.match?.links || []} title="LINKED INVOICE ROWS" />

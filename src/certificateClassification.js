@@ -513,6 +513,27 @@ function buildSupportedClassification(coverage, reasonParts) {
   });
 }
 
+function buildSupportedPocClassification(coverage, reasonParts) {
+  return buildClassification({
+    documentFamily: "supported_poc",
+    matchingMode: "poc_monthly_airport",
+    supportedBoolean: true,
+    processingMode: "supported_poc",
+    supportReason: reasonParts.join("; "),
+    coverage,
+  });
+}
+
+function isPocWithCanonicalizedMonthlyVolumes(data) {
+  const volumes = data?.monthlyVolumes;
+  if (!Array.isArray(volumes) || volumes.length < 1) return false;
+  return volumes.every(
+    (entry) =>
+      entry?.airportCanonical?.iata &&
+      /^[A-Z]{3}$/i.test(String(entry.airportCanonical.iata))
+  );
+}
+
 function buildManualOnlyClassification(coverage, reasonParts) {
   return buildClassification({
     documentFamily: "manual_only",
@@ -526,6 +547,26 @@ function buildManualOnlyClassification(coverage, reasonParts) {
 
 export function deriveCertificateClassification(data, context = {}) {
   const certKind = getCertKind(data);
+
+  // PoC with per-airport monthly volumes → automated multi-airport allocation path
+  if (certKind === "poc" && isPocWithCanonicalizedMonthlyVolumes(data)) {
+    const coverage = deriveSimpleMonthCoverage(data, context);
+    const totalVolume = parseFlexibleNumber(data?.quantity);
+    const pocRejections = [];
+    if (!Number.isFinite(totalVolume) || totalVolume <= 0)
+      pocRejections.push("certificate SAF volume is unclear");
+    if (isNonM3Unit(data?.quantityUnit))
+      pocRejections.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
+    if (pocRejections.length)
+      return buildManualOnlyClassification(coverage, ["POC certificate", ...pocRejections]);
+    return buildSupportedPocClassification(coverage, [
+      "POC certificate",
+      `${data.monthlyVolumes.length} airports with per-airport monthly volumes`,
+      `total SAF volume (${totalVolume} m3)`,
+      "all airport codes canonicalized",
+    ]);
+  }
+
   const airportCodes = getCanonicalAirportCodes(data);
   const airportCount = airportCodes.length;
   const coverage = deriveSimpleMonthCoverage(data, context);

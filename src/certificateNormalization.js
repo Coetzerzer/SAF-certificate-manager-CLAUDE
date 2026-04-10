@@ -280,6 +280,44 @@ function buildSimpleMonthlyUnits(data, airports, warnings) {
   ];
 }
 
+function buildPocMonthlyAirportUnits(data, airports, warnings) {
+  const volumes = data?.monthlyVolumes || [];
+  if (!volumes.length) {
+    warnings.push("poc_monthly_airport mode but monthlyVolumes is empty — falling back to manual-only unit.");
+    return buildManualOnlyUnits(data, airports, warnings);
+  }
+
+  return volumes.map((entry, index) => {
+    const iata = String(entry?.airportCanonical?.iata || "").toUpperCase();
+    const icao = String(entry?.airportCanonical?.icao || "").toUpperCase();
+    const airportLabel = entry?.airportCanonical?.label || entry?.airport || iata || icao || "";
+    const quantity = parseFlexibleNumber(entry?.quantity) || 0;
+    const monthBounds = makeMonthBounds(entry?.month);
+
+    if (!monthBounds.month) warnings.push(`Entry ${index}: could not parse month from "${entry?.month}".`);
+    if (!iata) warnings.push(`Entry ${index}: missing IATA — this unit will not match invoice rows.`);
+
+    return createBaseUnit({
+      key: `poc-monthly-airport-${index}`,
+      unitType: "poc-monthly-airport",
+      airport: airportLabel,
+      airportIata: iata,
+      airportIcao: icao,
+      airportName: airportLabel,
+      periodStart: monthBounds.start || data?.coverageStart || "",
+      periodEnd: monthBounds.end || data?.coverageEnd || "",
+      dispatchDate: data?.dateDispatch || "",
+      safVolume: quantity,
+      jetVolume: null,
+      quantityUnit: data?.quantityUnit || "",
+      source: "monthlyVolumes",
+      sourceReference: data?.uniqueNumber || data?.filename || "certificate",
+      matchingModeOverride: "poc_monthly_airport",
+      notes: `PoC per-airport monthly volume for ${iata || icao} ${monthBounds.month || ""}.`,
+    });
+  });
+}
+
 function buildManualOnlyUnits(data, airports, warnings) {
   warnings.push("This certificate is outside the supported simple scope and will not be auto-matched.");
   return [
@@ -307,6 +345,8 @@ function buildUnitsForMode(data, classification, airports, warnings) {
   switch (classification.matching_mode) {
     case "simple_monthly_airport":
       return buildSimpleMonthlyUnits(data, airports, warnings);
+    case "poc_monthly_airport":
+      return buildPocMonthlyAirportUnits(data, airports, warnings);
     case "manual_only":
     default:
       return buildManualOnlyUnits(data, airports, warnings);
@@ -341,6 +381,8 @@ function buildTransformations(data, classification, airports, units, warnings) {
     steps.push(isQuarterly
       ? "A single airport-quarter allocation unit was generated for deterministic FIFO matching across the quarter."
       : "A single airport-month allocation unit was generated for deterministic FIFO matching.");
+  } else if (classification.matching_mode === "poc_monthly_airport") {
+    steps.push(`${units.length} airport-month allocation units were generated for FIFO matching across ${units.length} airports.`);
   } else {
     steps.push("A manual-only aggregate allocation unit was generated because the certificate falls outside the supported scope.");
   }
