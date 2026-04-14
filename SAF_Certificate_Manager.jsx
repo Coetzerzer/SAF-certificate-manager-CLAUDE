@@ -629,7 +629,9 @@ function hydrateInvoiceRowsWithAllocations(rows, links, certs) {
       remaining_m3: summary.remainingVolume,
       is_allocated: summary.isAllocated,
       allocation_status: summary.status,
-      validation_note: summary.validationNote,
+      // Preserve DB-stored validation_note (e.g. "no cert found", "supplier over-declaration")
+      // unless the summary has a more critical system-level note (invalid saf, duplicate).
+      validation_note: summary.validationNote || row.validation_note || "",
       linked_cert_ids: linkedCertIds,
       linked_cert_numbers: linkedCertNumbers,
     };
@@ -1365,7 +1367,9 @@ function reconcileInvoiceRowValidationState(rows) {
       remaining_m3: summary.remainingVolume,
       is_allocated: summary.isAllocated,
       allocation_status: summary.status,
-      validation_note: summary.validationNote,
+      // Preserve DB-stored validation_note (e.g. scope-discrepancy annotations)
+      // unless summary yields a more critical system-level note (invalid saf, duplicate).
+      validation_note: summary.validationNote || row.validation_note || "",
     };
   });
 
@@ -1616,6 +1620,32 @@ function normalizeCommaDecimals(parsed) {
       ghgSaving: fix(batch.ghgSaving ?? ""),
       quantity: fix(batch.quantity ?? ""),
     }));
+  }
+  // Cross-check: underlyingPoSList.quantity vs top-level out.quantity.
+  // Catches LLM decimal-comma misreads ("1,185" → "1185") that the regex-based fix cannot detect
+  // (no separator left to anchor on), and MJ/L energy content mix-ups (ratio ≈ 33).
+  const topQty = Number(out.quantity);
+  if (Array.isArray(out.underlyingPoSList) && Number.isFinite(topQty) && topQty > 0) {
+    out.underlyingPoSList = out.underlyingPoSList.map((batch) => {
+      const bq = Number(batch.quantity);
+      if (!Number.isFinite(bq) || bq <= 0) return batch;
+      const ratio = bq / topQty;
+      if (ratio > 800 && ratio < 1200) {
+        return {
+          ...batch,
+          quantity: String(Number((bq / 1000).toFixed(6))),
+          _normalization_warning: `Divided underlying quantity by 1000 (comma-decimal anomaly: ${bq} → ${bq / 1000})`,
+        };
+      }
+      if (ratio > 10) {
+        return {
+          ...batch,
+          quantity: String(topQty),
+          _normalization_warning: `Replaced underlying quantity ${bq} with top-level ${topQty} (${ratio.toFixed(1)}× divergence — likely energy content mix-up)`,
+        };
+      }
+      return batch;
+    });
   }
   return out;
 }
@@ -2786,6 +2816,7 @@ function Badge({ status }) {
     duplicate: ["#ffbb00", "#1a1200"],
     invalid: ["#ff6666", "#1a0000"],
     widened: ["#ff9933", "#1a0d00"],
+    no_uplift: ["#6b7a8f", "#0a1220"],
   };
   const key = label.toLowerCase().replace(/\s+/g, "_");
   const [fg, bg] = map[key] || ["#c8dff0", "#0a1628"];
@@ -2906,7 +2937,14 @@ function buildDashboardData(certs, invoiceRows) {
     const status = match.status;
 
     if (["auto_linked", "approved", "partial_linked", "unmatched"].includes(status)) {
-      totalCertVolume += certVol;
+      // Subtract unit volumes for airport/months that have no 2025 Titan uplift (excluded_no_uplift)
+      // to avoid penalising coverage for airports where no allocation is possible.
+      const units = cert.allocation_units || [];
+      const excludedVol = units
+        .filter((u) => u.excluded_no_uplift)
+        .reduce((s, u) => s + (Number(u.saf_volume_m3) || 0), 0);
+      const includedCertVol = Math.max(0, certVol - excludedVol);
+      totalCertVolume += includedCertVol;
       totalAllocated += allocVol;
     }
 
@@ -3105,6 +3143,20 @@ function buildCertDetailData(certs, invoiceRows) {
     if (isNaN(d)) return null;
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   };
+  const monthFromPeriodStart = (value) => {
+    if (typeof value !== "string") return null;
+    const m = value.match(/^(\d{4})-(\d{2})/);
+    return m ? `${m[1]}-${m[2]}` : null;
+  };
+  const deriveUnitStatus = (certVol, allocVol, parentStatus, excludedNoUplift) => {
+    if (excludedNoUplift) return "no_uplift";
+    if (certVol <= 0) return parentStatus || "no_match";
+    if (allocVol <= MATCH_TOLERANCE) return "unmatched";
+    if (certVol - allocVol <= MATCH_TOLERANCE) {
+      return parentStatus === "approved" ? "approved" : "auto_linked";
+    }
+    return "partial_linked";
+  };
   const invoicePools = new Map();
   for (const row of invoiceRows || []) {
     const key = `${(row.iata || "").toUpperCase()}|${getRowMonth(row)}`;
@@ -3113,30 +3165,63 @@ function buildCertDetailData(certs, invoiceRows) {
     pool.rowCount++;
     invoicePools.set(key, pool);
   }
-  const result = certs.map((cert) => {
-    const airport = cert.data?.canonicalAirports?.[0]?.iata || "???";
-    const month = cert.data?.coverageMonth || "???";
-    const pool = invoicePools.get(`${airport}|${month}`);
-    const certVol = Number(cert.match?.cert_volume_m3) || 0;
-    const allocVol = Number(cert.match?.allocated_volume_m3) || 0;
-    return {
-      airport, month,
-      supplier: cert.data?.safSupplier || "—",
-      uniqueNumber: cert.unique_number || "—",
-      docType: cert.data?.docType || "—",
-      rawMaterial: cert.data?.rawMaterial || "—",
-      certVolume: certVol,
-      invoiceSaf: pool?.totalSaf || 0,
-      invoiceRowCount: pool?.rowCount || 0,
-      allocated: allocVol,
-      gap: certVol - allocVol,
-      status: cert.match?.status || "no_match",
-      matchMethod: cert.match?.match_method || "—",
-      coverage: certVol > 0 ? (allocVol / certVol) * 100 : 0,
-      cert,
-      isDuplicate: false,
-    };
-  }).sort((a, b) => a.airport.localeCompare(b.airport) || a.month.localeCompare(b.month) || b.gap - a.gap);
+  const result = [];
+  for (const cert of certs) {
+    const isPoc = (cert.document_family || cert.data?.document_family) === "supported_poc";
+    const units = Array.isArray(cert.allocation_units) ? cert.allocation_units : [];
+    if (isPoc && units.length > 0) {
+      for (const unit of units) {
+        const airport = (unit.airport_iata || "???").toUpperCase();
+        const month = monthFromPeriodStart(unit.period_start) || "???";
+        const pool = invoicePools.get(`${airport}|${month}`);
+        const certVol = Number(unit.saf_volume_m3) || 0;
+        const allocVol = Number(unit.consumed_volume_m3) || 0;
+        result.push({
+          airport, month,
+          supplier: cert.data?.safSupplier || "—",
+          uniqueNumber: cert.unique_number || "—",
+          unitIndex: unit.unit_index ?? null,
+          docType: cert.data?.docType || "—",
+          rawMaterial: cert.data?.rawMaterial || "—",
+          certVolume: certVol,
+          invoiceSaf: pool?.totalSaf || 0,
+          invoiceRowCount: pool?.rowCount || 0,
+          allocated: allocVol,
+          gap: certVol - allocVol,
+          status: deriveUnitStatus(certVol, allocVol, cert.match?.status, !!unit.excluded_no_uplift),
+          matchMethod: cert.match?.match_method || "poc-unit",
+          coverage: certVol > 0 ? (allocVol / certVol) * 100 : 0,
+          cert,
+          isDuplicate: false,
+        });
+      }
+    } else {
+      const airport = cert.data?.canonicalAirports?.[0]?.iata || "???";
+      const month = cert.data?.coverageMonth || "???";
+      const pool = invoicePools.get(`${airport}|${month}`);
+      const certVol = Number(cert.match?.cert_volume_m3) || 0;
+      const allocVol = Number(cert.match?.allocated_volume_m3) || 0;
+      result.push({
+        airport, month,
+        supplier: cert.data?.safSupplier || "—",
+        uniqueNumber: cert.unique_number || "—",
+        unitIndex: null,
+        docType: cert.data?.docType || "—",
+        rawMaterial: cert.data?.rawMaterial || "—",
+        certVolume: certVol,
+        invoiceSaf: pool?.totalSaf || 0,
+        invoiceRowCount: pool?.rowCount || 0,
+        allocated: allocVol,
+        gap: certVol - allocVol,
+        status: cert.match?.status || "no_match",
+        matchMethod: cert.match?.match_method || "—",
+        coverage: certVol > 0 ? (allocVol / certVol) * 100 : 0,
+        cert,
+        isDuplicate: false,
+      });
+    }
+  }
+  result.sort((a, b) => a.airport.localeCompare(b.airport) || a.month.localeCompare(b.month) || b.gap - a.gap);
 
   // Mark exact duplicates: same airport + month + volume
   const seen = new Map();
@@ -3186,7 +3271,7 @@ function CertDetailTable({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
   const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
   const fmtMonth = (m) => { if (!/^\d{4}-\d{2}$/.test(m)) return m; const [y, mo] = m.split("-"); return `${monthNames[Number(mo) - 1]} ${y.slice(2)}`; };
   const selectStyle = { background: "#0a1628", color: "#c8dff0", border: "1px solid #0d3060", borderRadius: 6, padding: "6px 10px", fontSize: 11, fontFamily: "'Space Mono', monospace" };
-  const statusColor = (s) => ({ approved: "#00ff9d", auto_linked: "#00ff9d", partial_linked: "#ff9933", unmatched: "#ff6666", manual_only: "#ffbb00" }[s] || "#4a7fa0");
+  const statusColor = (s) => ({ approved: "#00ff9d", auto_linked: "#00ff9d", partial_linked: "#ff9933", unmatched: "#ff6666", manual_only: "#ffbb00", no_uplift: "#6b7a8f" }[s] || "#4a7fa0");
 
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
@@ -3204,7 +3289,7 @@ function CertDetailTable({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
           {uniqueStatuses.map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
         <button className="btn" onClick={() => exportCertDetailCSV(filtered)} style={{ background: "#0a1628", color: "#00bfff", padding: "5px 12px", borderRadius: 5, fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 1, border: "1px solid #0d3060", cursor: "pointer" }}>EXPORT CSV</button>
-        <span style={{ color: "#4a7fa0", marginLeft: "auto" }}>Showing <span style={{ color: "#00bfff" }}>{filtered.length}</span> of <span style={{ color: "#00bfff" }}>{allRows.length}</span> certs</span>
+        <span style={{ color: "#4a7fa0", marginLeft: "auto" }}>Showing <span style={{ color: "#00bfff" }}>{filtered.length}</span> of <span style={{ color: "#00bfff" }}>{allRows.length}</span> rows</span>
       </div>
       <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
@@ -3217,7 +3302,7 @@ function CertDetailTable({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
           </thead>
           <tbody>
             {filtered.map((r, i) => (
-              <tr key={`${r.uniqueNumber}-${i}`} onClick={() => { const idx = certs.indexOf(r.cert); if (idx >= 0) { onSelectCert(idx); onSwitchTab("certs"); } }}
+              <tr key={`${r.uniqueNumber}-${r.unitIndex ?? ""}-${r.airport}-${r.month}-${i}`} onClick={() => { const idx = certs.indexOf(r.cert); if (idx >= 0) { onSelectCert(idx); onSwitchTab("certs"); } }}
                 style={{ borderBottom: "1px solid #0d2040", background: r.isDuplicate ? "#1a0a0a" : (i % 2 === 0 ? "#060e1a" : "#030d1a"), cursor: "pointer", borderLeft: `3px solid ${r.isDuplicate ? "#ff4444" : statusColor(r.status)}` }}>
                 <td style={{ padding: "6px 8px", color: "#e0f0ff", fontWeight: 600 }}>{r.airport}{r.isDuplicate ? <span style={{ color: "#ff4444", fontSize: 9, marginLeft: 4, fontWeight: 700 }} title="Exact duplicate: same airport + month + volume as another certificate">DUP</span> : null}</td>
                 <td style={{ padding: "6px 8px", color: "#c8dff0" }}>{fmtMonth(r.month)}</td>
@@ -3923,8 +4008,8 @@ export default function SAFManager({ onLogout, userEmail }) {
           .limit(1),
         supabase.from("invoices").select("*").not("csv_path", "is", null).order("created_at", { ascending: false }).limit(1),
         supabase.from("certificate_matches").select("*"),
-        supabase.from("certificate_invoice_links").select("*"),
-        supabase.from("certificate_allocation_units").select("*").order("unit_index", { ascending: true }),
+        fetchAllPages((from, to) => supabase.from("certificate_invoice_links").select("*").range(from, to)),
+        fetchAllPages((from, to) => supabase.from("certificate_allocation_units").select("*").order("unit_index", { ascending: true }).range(from, to)),
         supabase.from("client_certificates").select("*").order("created_at", { ascending: false }),
         supabase.from("companies").select("name, street, street_no, zip, city, country"),
       ]);
@@ -4805,6 +4890,13 @@ export default function SAFManager({ onLogout, userEmail }) {
           result.status === "unmatched" ? "error" : result.status === "manual_only" ? "info" : "success"
         );
         setLoading("");
+        try {
+          await Promise.all([
+            supabase.rpc("sync_invoice_allocation_flags"),
+            supabase.rpc("sync_allocation_units_consumed"),
+            supabase.rpc("sync_no_uplift_exclusions"),
+          ]);
+        } catch (syncErr) { /* best-effort */ }
         await loadFromDB();
         setTab("certs");
       } catch (error) {
@@ -4857,6 +4949,19 @@ export default function SAFManager({ onLogout, userEmail }) {
 
       if (failures.length) {
         addLog(`Matching completed with ${failures.length} failure(s) out of ${certs.length} certificate(s)`, "error");
+      }
+      // Reconcile derived flags from the link ledger (best-effort — don't block matching)
+      try {
+        const [{ data: flagData }, { data: unitData }, { data: noUpliftData }] = await Promise.all([
+          supabase.rpc("sync_invoice_allocation_flags"),
+          supabase.rpc("sync_allocation_units_consumed"),
+          supabase.rpc("sync_no_uplift_exclusions"),
+        ]);
+        if ((flagData ?? 0) > 0 || (unitData ?? 0) > 0 || (noUpliftData ?? 0) > 0) {
+          addLog(`Reconciled ${flagData ?? 0} invoice flag(s), ${unitData ?? 0} allocation unit(s), ${noUpliftData ?? 0} no-uplift exclusion(s)`, "info");
+        }
+      } catch (syncErr) {
+        addLog(`Post-match sync warning: ${syncErr.message}`, "error");
       }
       await loadFromDB();
       setTab("certs");
@@ -6276,7 +6381,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                     <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
                       <thead>
                         <tr style={{ borderBottom: "2px solid #0d3060" }}>
-                          {["STATUS", "LINKED CERT", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3"].map(
+                          {["STATUS", "LINKED CERT", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "ICAO", "COUNTRY", "SUPPLIER", "UPLIFT M3", "SAF M3", "REMAINING SAF M3", "NOTE"].map(
                             (header) => (
                               <th key={header} style={{ padding: "8px 12px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
                                 {header}
@@ -6321,6 +6426,14 @@ export default function SAFManager({ onLogout, userEmail }) {
                             <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.vol_m3)}</td>
                             <td style={{ padding: "7px 12px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.saf_vol_m3)}</td>
                             <td style={{ padding: "7px 12px", color: "#c8dff0" }}>{formatVolume(row.remaining_m3)}</td>
+                            <td style={{ padding: "7px 12px", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                              color: (row.validation_note || "").startsWith("Supplier over-declaration") ? "#ff9933"
+                                   : (row.validation_note || "").startsWith("No SAF certificate") ? "#ff6666"
+                                   : (row.validation_note || "").startsWith("Partial coverage") ? "#ffbb00"
+                                   : "#4a7fa0",
+                              fontSize: 9 }} title={row.validation_note || ""}>
+                              {row.validation_note ? row.validation_note : ""}
+                            </td>
                           </tr>
                         ))}
                       </tbody>

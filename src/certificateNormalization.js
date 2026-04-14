@@ -258,6 +258,14 @@ function buildSimpleMonthlyUnits(data, airports, warnings) {
   if (!monthBounds.month) warnings.push("Simple monthly normalization could not confirm the covered month.");
   if (airports.length > 1) warnings.push("Simple monthly path expects one airport, but multiple airports were extracted.");
 
+  // Sanity check: a single-airport/single-month PoS cert above 100 m³ is implausible in this dataset.
+  // Flag for review without altering the value — extraction error is possible (e.g., comma misread).
+  const safVolNum = parseFlexibleNumber(data?.quantity);
+  const implausible = safVolNum && safVolNum > 100;
+  if (implausible) {
+    warnings.push(`Implausible simple-monthly SAF volume ${safVolNum} m³ (>100) — flagged for review.`);
+  }
+
   return [
     createBaseUnit({
       key: "simple-monthly-airport",
@@ -275,6 +283,8 @@ function buildSimpleMonthlyUnits(data, airports, warnings) {
       source: "certificate aggregate",
       sourceReference: data?.uniqueNumber || data?.filename || "certificate",
       matchingModeOverride: "simple_monthly_airport",
+      reviewRequired: implausible || undefined,
+      normalizationWarning: implausible ? `Implausible SAF volume ${safVolNum} m³ — review extraction.` : undefined,
       notes: monthBounds.month ? `Simple supported airport-month volume for ${monthBounds.month}.` : "Simple supported airport-month volume.",
     }),
   ];
@@ -287,13 +297,36 @@ function buildPocMonthlyAirportUnits(data, airports, warnings) {
     return buildManualOnlyUnits(data, airports, warnings);
   }
 
+  // Merge duplicate (airport IATA × month) entries by summing quantities.
+  // This handles TotalEnergies tables with multiple rows for the same airport
+  // (e.g. two BGY entries, or three TLS entries).
+  const mergedMap = new Map();
+  for (const entry of volumes) {
+    const iata = String(entry?.airportCanonical?.iata || entry?.airport || "").toUpperCase();
+    const month = String(entry?.month || "");
+    const key = `${iata}::${month}`;
+    const qty = parseFlexibleNumber(entry?.quantity) || 0;
+    if (mergedMap.has(key)) {
+      const existing = mergedMap.get(key);
+      existing.quantity = (existing.quantity || 0) + qty;
+    } else {
+      mergedMap.set(key, { ...entry, quantity: qty, _iata: iata, _month: month });
+    }
+  }
+  const mergedVolumes = [...mergedMap.values()];
+  if (mergedVolumes.length < volumes.length) {
+    warnings.push(
+      `Merged ${volumes.length} monthlyVolumes entries into ${mergedVolumes.length} (duplicate airport×month entries were summed).`
+    );
+  }
+
   // Detect if monthlyVolumes contain total JET A-1 volumes instead of SAF volumes.
   // If their sum significantly exceeds the cert SAF total, normalize proportionally:
   //   saf_airport = (jet_airport / jet_total) × cert_saf_total
   // This handles TotalEnergies PoC format where the JET A-1 Sales table shows
   // total fuel volumes per airport and the SAF is a blended fraction of that total.
   const certSafTotal = parseFlexibleNumber(data?.quantity) || 0;
-  const rawQuantities = volumes.map((entry) => parseFlexibleNumber(entry?.quantity) || 0);
+  const rawQuantities = mergedVolumes.map((entry) => entry.quantity || 0);
   const rawSum = rawQuantities.reduce((acc, q) => acc + q, 0);
   const PROPORTIONAL_THRESHOLD = 1.05; // allow 5% rounding headroom
   const needsProportionalNormalization = certSafTotal > 0 && rawSum > certSafTotal * PROPORTIONAL_THRESHOLD;
@@ -305,8 +338,8 @@ function buildPocMonthlyAirportUnits(data, airports, warnings) {
     );
   }
 
-  return volumes.map((entry, index) => {
-    const iata = String(entry?.airportCanonical?.iata || "").toUpperCase();
+  return mergedVolumes.map((entry, index) => {
+    const iata = String(entry?.airportCanonical?.iata || entry?._iata || "").toUpperCase();
     const icao = String(entry?.airportCanonical?.icao || "").toUpperCase();
     const airportLabel = entry?.airportCanonical?.label || entry?.airport || iata || icao || "";
     const rawQty = rawQuantities[index];

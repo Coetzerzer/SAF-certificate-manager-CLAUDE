@@ -172,8 +172,29 @@ function isValidAirportCode(code, type) {
 
 function normalizeAirportEntry(entry) {
   if (!entry) return null;
-  const rawIata = normalizeAirportCode(entry.iata);
-  const rawIcao = normalizeAirportCode(entry.icao);
+  let rawIata = normalizeAirportCode(entry.iata);
+  let rawIcao = normalizeAirportCode(entry.icao);
+  // Fallback: if iata/icao are empty but `raw` has a composite "IATA/ICAO" form
+  // (e.g. "LUX/ELLX", "CDG-LFPG", "LUX ELLX"), split it into the two codes.
+  // Also handle the single-code cases ("LUX" → iata, "ELLX" → icao).
+  if (!rawIata && !rawIcao) {
+    const rawText = String(entry.raw || entry.label || "").trim().toUpperCase();
+    if (rawText) {
+      const composite = rawText.match(/^([A-Z]{3})\s*[\/\-\s]\s*([A-Z]{4})$/);
+      const invertedComposite = rawText.match(/^([A-Z]{4})\s*[\/\-\s]\s*([A-Z]{3})$/);
+      if (composite) {
+        rawIata = composite[1];
+        rawIcao = composite[2];
+      } else if (invertedComposite) {
+        rawIcao = invertedComposite[1];
+        rawIata = invertedComposite[2];
+      } else if (/^[A-Z]{3}$/.test(rawText)) {
+        rawIata = rawText;
+      } else if (/^[A-Z]{4}$/.test(rawText)) {
+        rawIcao = rawText;
+      }
+    }
+  }
   const iata = isValidAirportCode(rawIata, "iata") ? rawIata : "";
   const icao = isValidAirportCode(rawIcao, "icao") ? rawIcao : "";
   const raw = String(entry.raw || "").trim();
@@ -545,6 +566,47 @@ function buildManualOnlyClassification(coverage, reasonParts) {
   });
 }
 
+// Count distinct months spanned by data.supplyPeriod "DD/MM/YYYY - DD/MM/YYYY".
+// Returns 0 if unparseable.
+function monthsInSupplyPeriod(data) {
+  const raw = String(data?.supplyPeriod || "").trim();
+  const match = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s*-\s*(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!match) return 0;
+  const startYear = Number(match[3]);
+  const startMonth = Number(match[2]);
+  const endYear = Number(match[6]);
+  const endMonth = Number(match[5]);
+  if (!Number.isFinite(startYear) || !Number.isFinite(endYear)) return 0;
+  return (endYear - startYear) * 12 + (endMonth - startMonth) + 1;
+}
+
+// Multi-month PoS covering a single airport over many months (e.g. TotalEnergies TEA-* annual
+// supply certs). These must be routed to poc_monthly_airport allocation so SAF is matched
+// mois-par-mois instead of being pinned to coverageMonth.
+//
+// Requirements:
+//   - data.monthlyVolumes has >= 3 entries (so the PoC builder can produce >= 3 units)
+//   - All entries canonicalize to the SAME IATA (single-airport)
+//   - >= 3 distinct months are covered
+// The supplyPeriod-only fallback is intentionally NOT used: without monthlyVolumes we cannot
+// distribute volume per month, so we leave such certs to the standard path (which will push
+// them to manual_only via the "annual coverage" rejection).
+function isMultiMonthSingleAirportPoS(data) {
+  const volumes = data?.monthlyVolumes;
+  if (!Array.isArray(volumes) || volumes.length < 3) return false;
+  const iatas = new Set(
+    volumes
+      .map((v) => String(v?.airportCanonical?.iata || "").toUpperCase())
+      .filter((code) => /^[A-Z]{3}$/.test(code))
+  );
+  const months = new Set(
+    volumes.map((v) => String(v?.month || "").trim()).filter((m) => /^\d{4}-\d{2}$/.test(m))
+  );
+  if (iatas.size !== 1 || months.size < 3) return false;
+  // Defensive cross-check: supply period should also span multiple months
+  return monthsInSupplyPeriod(data) > 1;
+}
+
 export function deriveCertificateClassification(data, context = {}) {
   const certKind = getCertKind(data);
 
@@ -564,6 +626,29 @@ export function deriveCertificateClassification(data, context = {}) {
       `${data.monthlyVolumes.length} airports with per-airport monthly volumes`,
       `total SAF volume (${totalVolume} m3)`,
       "all airport codes canonicalized",
+    ]);
+  }
+
+  // Annual/multi-month PoS cert covering a single airport (e.g., TotalEnergies TEA-* supply certs).
+  // Without this branch, they would be mis-classified as simple_monthly_airport and matched
+  // against a single coverageMonth instead of the full supply period.
+  if (certKind === "pos" && isMultiMonthSingleAirportPoS(data)) {
+    const coverage = deriveSimpleMonthCoverage(data, context);
+    const totalVolume = parseFlexibleNumber(data?.quantity);
+    const nMonths = monthsInSupplyPeriod(data);
+    const nMvMonths = new Set((data?.monthlyVolumes || []).map((v) => v?.month).filter(Boolean)).size;
+    const pocRejections = [];
+    if (!Number.isFinite(totalVolume) || totalVolume <= 0)
+      pocRejections.push("certificate SAF volume is unclear");
+    if (isNonM3Unit(data?.quantityUnit))
+      pocRejections.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
+    if (pocRejections.length)
+      return buildManualOnlyClassification(coverage, ["Multi-month PoS", ...pocRejections]);
+    return buildSupportedPocClassification(coverage, [
+      "Multi-month single-airport PoS (annual supply)",
+      `${Math.max(nMonths, nMvMonths)} months spanned`,
+      `total SAF ${totalVolume} m3`,
+      "routed to poc_monthly_airport for per-month audit trail",
     ]);
   }
 
