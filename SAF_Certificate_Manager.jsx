@@ -2920,6 +2920,22 @@ function MatchRowsTable({ rows, title = "LINKED INVOICE ROWS", emptyText = "No l
   );
 }
 
+function monthFromPeriodStart(value) {
+  if (typeof value !== "string") return null;
+  const m = value.match(/^(\d{4})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}` : null;
+}
+
+function deriveUnitStatus(certVol, allocVol, parentStatus, excludedNoUplift) {
+  if (excludedNoUplift) return "no_uplift";
+  if (certVol <= 0) return parentStatus || "no_match";
+  if (allocVol <= MATCH_TOLERANCE) return "unmatched";
+  if (certVol - allocVol <= MATCH_TOLERANCE) {
+    return parentStatus === "approved" ? "approved" : "auto_linked";
+  }
+  return "partial_linked";
+}
+
 function buildDashboardData(certs, invoiceRows) {
   const grid = {};
   const airports = new Set();
@@ -2927,6 +2943,25 @@ function buildDashboardData(certs, invoiceRows) {
   let totalCertVolume = 0;
   let totalAllocated = 0;
   const alerts = [];
+
+  // Rank used to compute the per-cell worstStatus. "no_uplift" has negative rank so it never
+  // overrides any real status sharing the same cell.
+  const statusRank = { unmatched: 3, partial_linked: 2, manual_only: 1, auto_linked: 0, approved: 0, no_uplift: -1 };
+
+  const addToGrid = (airport, month, certVolDelta, allocVolDelta, cellStatus, cert, isNoUplift) => {
+    if (!airport || airport === "???" || !month || month === "???") return;
+    airports.add(airport);
+    months.add(month);
+    const key = `${airport}|${month}`;
+    if (!grid[key]) grid[key] = { certVolume: 0, allocatedVolume: 0, certs: [], worstStatus: null, hasNoUplift: false };
+    grid[key].certVolume += certVolDelta;
+    grid[key].allocatedVolume += allocVolDelta;
+    if (!grid[key].certs.includes(cert)) grid[key].certs.push(cert);
+    if (isNoUplift) grid[key].hasNoUplift = true;
+    if (grid[key].worstStatus === null || (statusRank[cellStatus] ?? 0) > (statusRank[grid[key].worstStatus] ?? 0)) {
+      grid[key].worstStatus = cellStatus;
+    }
+  };
 
   for (const cert of certs) {
     const match = cert.match;
@@ -2948,39 +2983,44 @@ function buildDashboardData(certs, invoiceRows) {
       totalAllocated += allocVol;
     }
 
-    const canonicalAirports = cert.data?.canonicalAirports || [];
-    const airportCode = canonicalAirports[0]?.iata || "???";
-    const month = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
-
-    if (airportCode === "???" || month === "???") continue;
-    airports.add(airportCode);
-    months.add(month);
-
-    const key = `${airportCode}|${month}`;
-    if (!grid[key]) grid[key] = { certVolume: 0, allocatedVolume: 0, certs: [], worstStatus: null };
-    grid[key].certVolume += certVol;
-    grid[key].allocatedVolume += allocVol;
-    grid[key].certs.push(cert);
-
-    const statusRank = { unmatched: 3, partial_linked: 2, manual_only: 1, auto_linked: 0, approved: 0 };
-    if (grid[key].worstStatus === null || (statusRank[status] || 0) > (statusRank[grid[key].worstStatus] || 0)) {
-      grid[key].worstStatus = status;
+    // Populate grid: one cell per allocation unit (airport × month). Falls back to the cert's
+    // canonicalAirports[0] + coverageMonth only when no allocation units are attached.
+    const units = Array.isArray(cert.allocation_units) ? cert.allocation_units : [];
+    if (units.length > 0) {
+      for (const unit of units) {
+        const airport = (unit.airport_iata || "").toUpperCase();
+        const month = monthFromPeriodStart(unit.period_start);
+        if (!airport || !month) continue;
+        const uCertVol = Number(unit.saf_volume_m3) || 0;
+        const uAllocVol = Number(unit.consumed_volume_m3) || 0;
+        const excluded = !!unit.excluded_no_uplift;
+        const unitStatus = deriveUnitStatus(uCertVol, uAllocVol, status, excluded);
+        addToGrid(airport, month, uCertVol, uAllocVol, unitStatus, cert, excluded);
+      }
+    } else {
+      const canonicalAirports = cert.data?.canonicalAirports || [];
+      const airportCode = canonicalAirports[0]?.iata || "???";
+      const month = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
+      addToGrid(airportCode, month, certVol, allocVol, status, cert, false);
     }
 
-    // Alerts
+    // Alerts (cert-level, unchanged)
+    const canonicalAirports = cert.data?.canonicalAirports || [];
+    const primaryAirport = canonicalAirports[0]?.iata || "???";
+    const primaryMonth = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
     if (certVol > 50) {
-      alerts.push({ type: "volume", cert, message: `${airportCode} ${month}: volume ${certVol.toFixed(1)} m³ exceeds plausibility threshold` });
+      alerts.push({ type: "volume", cert, message: `${primaryAirport} ${primaryMonth}: volume ${certVol.toFixed(1)} m³ exceeds plausibility threshold` });
     }
     if (status === "partial_linked" && certVol > 0 && allocVol / certVol < 0.10 && !match.match_method?.includes("widened")) {
-      alerts.push({ type: "gap", cert, message: `${airportCode} ${month}: only ${(allocVol / certVol * 100).toFixed(1)}% allocated — probable extraction error` });
+      alerts.push({ type: "gap", cert, message: `${primaryAirport} ${primaryMonth}: only ${(allocVol / certVol * 100).toFixed(1)}% allocated — probable extraction error` });
     }
     if (status === "unmatched") {
       const totalRows = Number(match.diagnostics?.total_row_count) || 0;
       alerts.push({
         type: "unmatched", cert,
         message: totalRows > 0
-          ? `${airportCode} ${month}: ${totalRows} invoice rows found but all SAF volume consumed by other certs`
-          : `${airportCode} ${month}: no invoice rows found for this airport/month`
+          ? `${primaryAirport} ${primaryMonth}: ${totalRows} invoice rows found but all SAF volume consumed by other certs`
+          : `${primaryAirport} ${primaryMonth}: no invoice rows found for this airport/month`
       });
     }
     if (status === "manual_only" && cert.document_family === "manual_only") {
@@ -3017,6 +3057,7 @@ function DashboardTab({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
     if (cell.worstStatus === "partial_linked") return { bg: "#1a0d00", fg: "#ff9933", label: "PARTIAL" };
     if (cell.worstStatus === "unmatched") return { bg: "#1a0000", fg: "#ff6666", label: "UNMATCHED" };
     if (cell.worstStatus === "manual_only") return { bg: "#1a1200", fg: "#ffbb00", label: "MANUAL" };
+    if (cell.worstStatus === "no_uplift") return { bg: "#0a1020", fg: "#556680", label: "NO UPLIFT" };
     return { bg: "#0a1628", fg: "#4a7fa0", label: "?" };
   };
 
@@ -3058,7 +3099,7 @@ function DashboardTab({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
                     const { bg, fg, label } = cellColor(cell);
                     return (
                       <td key={m} style={{ padding: "6px 8px", textAlign: "center" }}
-                        title={cell ? `Cert: ${cell.certVolume.toFixed(3)} m³\nAllocated: ${cell.allocatedVolume.toFixed(3)} m³\nGap: ${(cell.certVolume - cell.allocatedVolume).toFixed(3)} m³` : "No certificate"}>
+                        title={cell ? `Cert: ${cell.certVolume.toFixed(3)} m³\nAllocated: ${cell.allocatedVolume.toFixed(3)} m³\nGap: ${(cell.certVolume - cell.allocatedVolume).toFixed(3)} m³${cell.hasNoUplift ? "\n(no Titan uplift at this airport/month)" : ""}` : "No certificate"}>
                         <span style={{ display: "inline-block", padding: "3px 8px", borderRadius: 4, background: bg, color: fg, fontSize: 9, fontWeight: 700, minWidth: 50 }}>
                           {cell ? `${cell.allocatedVolume.toFixed(2)}` : "—"}
                         </span>
@@ -3142,20 +3183,6 @@ function buildCertDetailData(certs, invoiceRows) {
     const d = new Date(row.uplift_date);
     if (isNaN(d)) return null;
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  };
-  const monthFromPeriodStart = (value) => {
-    if (typeof value !== "string") return null;
-    const m = value.match(/^(\d{4})-(\d{2})/);
-    return m ? `${m[1]}-${m[2]}` : null;
-  };
-  const deriveUnitStatus = (certVol, allocVol, parentStatus, excludedNoUplift) => {
-    if (excludedNoUplift) return "no_uplift";
-    if (certVol <= 0) return parentStatus || "no_match";
-    if (allocVol <= MATCH_TOLERANCE) return "unmatched";
-    if (certVol - allocVol <= MATCH_TOLERANCE) {
-      return parentStatus === "approved" ? "approved" : "auto_linked";
-    }
-    return "partial_linked";
   };
   const invoicePools = new Map();
   for (const row of invoiceRows || []) {
