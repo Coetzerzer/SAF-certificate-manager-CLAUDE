@@ -23,13 +23,13 @@ Extract ALL of the following fields from this certificate PDF. Return ONLY a val
   "contractNumber": "all contract references found (comma-separated if multiple, e.g. LMT21482_1576, LMT22430_1576)",
   "dispatchAddress": "",
   "receiptAddress": "",
-  "additionalInformation": "free-text from 'Additional Information' or similar notes field",
+  "additionalInformation": "VERBATIM copy of the 'Additional Information (voluntary)' field — even if it looks unimportant. This often contains scope hints like '4Q25 Delivery', 'MAD delivery 2025 (IBZ & MAH)', 'Annual', etc. NEVER summarize or omit",
   "supplyPeriod": "for PoC: the full supply period, e.g. '01/01/2025 – 31/12/2025'",
   "dateDispatch": "for PoS: the actual dispatch date; leave empty for PoC",
   "physicalDeliveryAirport": "ICAO or name of the main physical delivery airport",
-  "deliveryAirports": "all delivery airports listed (comma-separated ICAO/IATA codes)",
-  "matchingMode": "monthly-pos | uplift-pos | poc",
-  "coverageGranularity": "month | day | period",
+  "deliveryAirports": "all delivery airports listed (comma-separated ICAO/IATA codes), INCLUDING any extra airports mentioned in 'Additional Information' parentheses like '(IBZ & MAH)' or '(LIN, MXP)'",
+  "matchingMode": "monthly-pos | quarterly-pos | yearly-pos | period-pos | uplift-pos | poc",
+  "coverageGranularity": "month | quarter | year | period | day",
   "coverageMonth": "YYYY-MM when the document covers one month",
   "coverageStart": "YYYY-MM-DD",
   "coverageEnd": "YYYY-MM-DD",
@@ -86,18 +86,27 @@ IMPORTANT RULES:
 - For PoS, "dateDispatch" must be the "Date of dispatch of the sustainable material" (or equivalent transport/dispatch wording). Do NOT copy the certificate issue/signature/issuance date into "dateDispatch".
 - For PoC, "supplyPeriod" is the reconciliation date field. Leave "dateDispatch" empty unless the document truly provides a dispatch date for the sustainable material.
 - "dateIssuance" is only the document issue/signature date and must never be used as uplift/dispatch date.
-- Extract "additionalInformation" from the document when present, especially "Additional Information (voluntary)" style fields.
-- matchingMode rules:
+- ALWAYS extract "additionalInformation" VERBATIM from the document — including text in the "Additional Information (voluntary)" field even if short or seemingly trivial. Examples to preserve exactly: "4Q25 Delivery", "3Q25 Delivery", "MAD delivery 2025 (IBZ & MAH)", "Annual 2025". This field often contains the TRUE scope (quarter / year / multi-airport) that overrides the dispatch date.
+- ALWAYS extract "contractNumber" VERBATIM. Examples: "ALC. SAF Delivery April 2025" (monthly), "VLC. HEFA Delivery April-December 2025" (period), "MJV. HEFA Delivery 2025" (annual). The wording in this field is critical for scope detection.
+- matchingMode rules — INSPECT 'additionalInformation' AND 'contractNumber' BEFORE deciding:
   - Use "poc" for PoC documents.
-  - Use "monthly-pos" for one-airport PoS documents that represent a monthly certified quantity, especially when the document or notes say things like "SAF Delivery February 2025".
+  - Use "quarterly-pos" if 'additionalInformation' or 'contractNumber' contains a quarter marker like "1Q25", "2Q25", "3Q25", "4Q25", "Q1 2025", "Q4 2025", "1st Quarter 2025", etc. (one airport, one quarter).
+  - Use "yearly-pos" if 'contractNumber' or 'additionalInformation' says "Delivery YYYY", "Annual YYYY", or any year-only scope without a month.
+  - Use "period-pos" if the document explicitly mentions a multi-month range like "April-December 2025", "Apr-Dec 2025", or "from MM/YYYY to MM/YYYY".
+  - Use "monthly-pos" for one-airport PoS documents that represent a monthly certified quantity (e.g. "SAF Delivery February 2025").
   - Use "uplift-pos" only when the document clearly refers to a single shipment / uplift / delivery event rather than a monthly airport total.
-- For one-airport PoS documents with no clear single-uplift evidence, prefer "monthly-pos".
+  - For one-airport PoS documents with no clear single-uplift evidence and no quarter/year/period markers, prefer "monthly-pos".
 - coverage rules:
   - For "monthly-pos", set "coverageGranularity" = "month", infer "coverageMonth" as YYYY-MM, and set "coverageStart"/"coverageEnd" to the first and last day of that month.
+  - For "quarterly-pos", set "coverageGranularity" = "quarter" and set "coverageStart" / "coverageEnd" to the FIRST and LAST day of the quarter (e.g. for 4Q25: coverageStart="2025-10-01", coverageEnd="2025-12-31"). Set "coverageMonth" to the LAST month of the quarter (YYYY-MM).
+  - For "yearly-pos", set "coverageGranularity" = "year", "coverageStart" = "YYYY-01-01", "coverageEnd" = "YYYY-12-31", and "coverageMonth" = "YYYY-12" (last month).
+  - For "period-pos", set "coverageGranularity" = "period" and the actual start/end dates from the period mentioned. Set "coverageMonth" to the LAST month of the period.
   - If the document says e.g. "SAF Delivery February 2025", use that month for coverage even if "dateDispatch" is the month-end date.
   - For "uplift-pos", set "coverageGranularity" = "day" and set "coverageStart" = "coverageEnd" = the actual uplift/dispatch date.
   - For "poc", set "coverageGranularity" = "period" and use the documented supply period where possible.
-- "matchingEvidence" should be a short phrase like "additional-information-month", "single-airport-pos-default", "explicit-uplift-wording", or "poc-supply-period".
+- MULTI-AIRPORT in 'additionalInformation': if the field contains parentheses with extra airport codes like "(IBZ & MAH)", "(LIN, MXP)", "(BCN, AGP)", these airports MUST be added to "deliveryAirports" (comma-separated) IN ADDITION to the primary delivery airport. The certificate covers ALL listed airports.
+  - Example: contractNumber "MAD. SAF Delivery December 2025" + additionalInformation "MAD delivery 2025 (IBZ & MAH)" → deliveryAirports = "IBZ, MAH" (the parenthetical airports are the actual scope; MAD is just the logistics hub) AND coverageGranularity = "year".
+- "matchingEvidence" should be a short phrase like "additional-information-quarter", "additional-information-year", "contract-number-period", "additional-information-multi-airport", "single-airport-pos-default", "explicit-uplift-wording", or "poc-supply-period".
 - contractNumber: capture ALL contract references (look for EXTRANET refs, LMT numbers, contract IDs).
 - isComplexPoC: set to "true" if this is a PoC covering 3 or more airports with a breakdown table of volumes per month. Otherwise "false" or "".
 - monthlyVolumes: if the document contains a table with volumes broken down by month AND airport, extract each row as an entry with "month" (YYYY-MM), "airport" (ICAO or IATA code), "quantity", "quantityUnit". Leave as [] if no such table exists.
@@ -134,6 +143,182 @@ function extractOutputText(payload: any) {
     }
   }
   return "";
+}
+
+// Static legacy IATA mapping (mirror of public.iata_legacy_mapping).
+// Update both this table and the SQL table when adding new entries.
+const LEGACY_IATA_MAPPING: Record<string, { iata: string; icao?: string; label?: string }> = {
+  MJV: { iata: "RMU", icao: "LEMI", label: "Murcia (ex-San Javier)" },
+};
+
+function quarterBounds(year: number, quarter: number): { start: string; end: string; lastMonth: string } {
+  const startMonth = (quarter - 1) * 3 + 1;
+  const endMonth = startMonth + 2;
+  const start = `${year}-${String(startMonth).padStart(2, "0")}-01`;
+  // Last day: build first of next month then subtract a day, or pin Q1=Mar31, Q2=Jun30, Q3=Sep30, Q4=Dec31
+  const lastDays: Record<number, string> = { 3: "31", 6: "30", 9: "30", 12: "31" };
+  const end = `${year}-${String(endMonth).padStart(2, "0")}-${lastDays[endMonth]}`;
+  const lastMonth = `${year}-${String(endMonth).padStart(2, "0")}`;
+  return { start, end, lastMonth };
+}
+
+const MONTH_NAMES: Record<string, number> = {
+  jan: 1, january: 1, janvier: 1, enero: 1, gennaio: 1,
+  feb: 2, february: 2, fevrier: 2, février: 2, febrero: 2, febbraio: 2,
+  mar: 3, march: 3, mars: 3, marzo: 3,
+  apr: 4, april: 4, avril: 4, abril: 4, aprile: 4,
+  may: 5, mai: 5, mayo: 5, maggio: 5,
+  jun: 6, june: 6, juin: 6, junio: 6, giugno: 6,
+  jul: 7, july: 7, juillet: 7, julio: 7, luglio: 7,
+  aug: 8, august: 8, août: 8, aout: 8, agosto: 8,
+  sep: 9, sept: 9, september: 9, septembre: 9, septiembre: 9, settembre: 9,
+  oct: 10, october: 10, octobre: 10, octubre: 10, ottobre: 10,
+  nov: 11, november: 11, novembre: 11, noviembre: 11,
+  dec: 12, december: 12, décembre: 12, decembre: 12, diciembre: 12, dicembre: 12,
+};
+
+function monthEndDay(year: number, month: number): string {
+  const d = new Date(Date.UTC(year, month, 0));
+  return String(d.getUTCDate()).padStart(2, "0");
+}
+
+/**
+ * Detect quarter / year / period scope hints in 'additionalInformation' and
+ * 'contractNumber'. Override coverageStart / coverageEnd / coverageGranularity
+ * if a stronger scope is found.
+ *
+ * Returns an updated parsed object.
+ */
+function detectScopeOverrides(parsed: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...parsed };
+  const addl = String(parsed.additionalInformation ?? "").trim();
+  const contract = String(parsed.contractNumber ?? "").trim();
+  const blob = `${addl} | ${contract}`;
+  const dispatchStr = String(parsed.dateDispatch ?? "");
+  // Try to infer year from dispatch date (DD/MM/YYYY) or coverageMonth (YYYY-MM)
+  let year: number | null = null;
+  const dispatchMatch = dispatchStr.match(/(\d{2})[\/\-](\d{2})[\/\-](\d{4})/);
+  if (dispatchMatch) year = parseInt(dispatchMatch[3], 10);
+  if (!year) {
+    const cm = String(parsed.coverageMonth ?? "").match(/^(\d{4})-\d{2}$/);
+    if (cm) year = parseInt(cm[1], 10);
+  }
+  if (!year) {
+    const yearInBlob = blob.match(/\b(20\d{2})\b/);
+    if (yearInBlob) year = parseInt(yearInBlob[1], 10);
+  }
+  if (!year) return out;
+
+  // Pattern 1: "1Q25", "2Q25", "3Q25", "4Q25" or "Q1 2025" / "Q4 2025" / "1st quarter 2025"
+  const quarterMatch = blob.match(/\b([1-4])Q(\d{2})\b/i)
+    || blob.match(/\bQ([1-4])\s*(20\d{2})\b/i)
+    || blob.match(/\b([1-4])(?:st|nd|rd|th)?\s*Quarter\s*(20\d{2})\b/i);
+  if (quarterMatch) {
+    const q = parseInt(quarterMatch[1], 10);
+    const qYear = quarterMatch[2].length === 2 ? 2000 + parseInt(quarterMatch[2], 10) : parseInt(quarterMatch[2], 10);
+    const { start, end, lastMonth } = quarterBounds(qYear, q);
+    out.coverageStart = start;
+    out.coverageEnd = end;
+    out.coverageMonth = lastMonth;
+    out.coverageGranularity = "quarter";
+    out.matchingMode = "quarterly-pos";
+    out.matchingEvidence = "additional-information-quarter";
+    out._scopeOverrideSource = `quarter ${q}Q${qYear}`;
+  }
+
+  // Pattern 2: "Month-Month YYYY" (period range, e.g. "April-December 2025")
+  if (!quarterMatch) {
+    // Match "April-December 2025", "April – December 2025", "April to December 2025"
+    const periodMatch = blob.match(/\b([A-Za-z]+)\s*(?:[-–—]\s*|\s+to\s+)\s*([A-Za-z]+)\s+(20\d{2})\b/i);
+    if (periodMatch) {
+      const m1 = MONTH_NAMES[periodMatch[1].toLowerCase()];
+      const m2 = MONTH_NAMES[periodMatch[2].toLowerCase()];
+      const periodYear = parseInt(periodMatch[3], 10);
+      if (m1 && m2 && m2 >= m1) {
+        out.coverageStart = `${periodYear}-${String(m1).padStart(2, "0")}-01`;
+        out.coverageEnd = `${periodYear}-${String(m2).padStart(2, "0")}-${monthEndDay(periodYear, m2)}`;
+        out.coverageMonth = `${periodYear}-${String(m2).padStart(2, "0")}`;
+        out.coverageGranularity = "period";
+        out.matchingMode = "period-pos";
+        out.matchingEvidence = "contract-number-period";
+        out._scopeOverrideSource = `period ${periodMatch[1]}-${periodMatch[2]} ${periodYear}`;
+      }
+    }
+  }
+
+  // Pattern 3: Annual — contract number says "Delivery YYYY" without a month (after period detection)
+  if (out.coverageGranularity !== "quarter" && out.coverageGranularity !== "period") {
+    // Detect "Delivery 2025" or "Annual 2025" without month name. Reject if a single month name appears.
+    const hasMonthName = Object.keys(MONTH_NAMES).some((m) => new RegExp(`\\b${m}\\b`, "i").test(blob));
+    const annualMatch = blob.match(/\b(?:Delivery|Annual|Annuel|Year|Anno)\s*(20\d{2})\b/i);
+    if (annualMatch && !hasMonthName) {
+      const yr = parseInt(annualMatch[1], 10);
+      out.coverageStart = `${yr}-01-01`;
+      out.coverageEnd = `${yr}-12-31`;
+      out.coverageMonth = `${yr}-12`;
+      out.coverageGranularity = "year";
+      out.matchingMode = "yearly-pos";
+      out.matchingEvidence = "contract-number-year";
+      out._scopeOverrideSource = `annual ${yr}`;
+    }
+  }
+
+  // Pattern 4: Multi-airport in parentheses, e.g. "(IBZ & MAH)" or "(LIN, MXP)"
+  // The parenthetical airports are the TRUE delivery scope when the issuance airport is just a logistics hub.
+  const multiMatch = addl.match(/\(([A-Z]{3}(?:\s*[&,\/]\s*[A-Z]{3})+)\)/);
+  if (multiMatch) {
+    const airports = multiMatch[1].split(/[&,\/]/).map((a) => a.trim().toUpperCase()).filter((a) => /^[A-Z]{3}$/.test(a));
+    if (airports.length >= 2) {
+      // If 'Annual' was also detected above, treat the parenthetical airports as the FULL scope.
+      // Replace deliveryAirports + canonicalAirports.
+      out.deliveryAirports = airports.join(", ");
+      out.canonicalAirports = airports.map((a) => ({ raw: a, iata: a }));
+      out._scopeOverrideSource = `${out._scopeOverrideSource ?? ""} multi-airport(${airports.join(",")})`.trim();
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Apply legacy IATA → current IATA remapping on canonicalAirports and physicalDeliveryAirportCanonical.
+ * Idempotent.
+ */
+function applyLegacyIataRemap(parsed: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...parsed };
+  const remapOne = (entry: any) => {
+    if (!entry || typeof entry !== "object") return entry;
+    const orig = String(entry.iata ?? "").toUpperCase();
+    const mapping = LEGACY_IATA_MAPPING[orig];
+    if (!mapping) return entry;
+    return {
+      ...entry,
+      raw: entry.raw ?? orig,
+      iata: mapping.iata,
+      icao: mapping.icao ?? entry.icao ?? "",
+      label: mapping.label ?? entry.label ?? "",
+      _remappedFrom: orig,
+    };
+  };
+
+  if (Array.isArray(out.canonicalAirports)) {
+    out.canonicalAirports = out.canonicalAirports.map(remapOne);
+  }
+  if (out.physicalDeliveryAirportCanonical && typeof out.physicalDeliveryAirportCanonical === "object") {
+    out.physicalDeliveryAirportCanonical = remapOne(out.physicalDeliveryAirportCanonical);
+  }
+  // Also rewrite deliveryAirports text if it contains a legacy code.
+  if (typeof out.deliveryAirports === "string" && out.deliveryAirports) {
+    const remapped = out.deliveryAirports
+      .split(/[,;\/]/)
+      .map((p: string) => {
+        const trimmed = p.trim().toUpperCase();
+        return LEGACY_IATA_MAPPING[trimmed]?.iata ?? p.trim();
+      })
+      .join(", ");
+    out.deliveryAirports = remapped;
+  }
+  return out;
 }
 
 function normalizeCommaDecimals(parsed: Record<string, unknown>) {
@@ -255,7 +440,22 @@ Deno.serve(async (req) => {
     }
 
     const clean = outputText.replace(/```json|```/g, "").trim();
-    const parsed = normalizeCommaDecimals(JSON.parse(clean));
+    let parsed = normalizeCommaDecimals(JSON.parse(clean));
+
+    // Detect quarter / year / period scope hints in additionalInformation + contractNumber.
+    // Defensive: a bad regex / input should NOT crash the whole extraction.
+    try {
+      parsed = detectScopeOverrides(parsed);
+    } catch (e) {
+      parsed._scopeOverrideError = e instanceof Error ? e.message : String(e);
+    }
+
+    // Remap legacy IATA codes (e.g. MJV → RMU). Same defensive wrap.
+    try {
+      parsed = applyLegacyIataRemap(parsed);
+    } catch (e) {
+      parsed._legacyRemapError = e instanceof Error ? e.message : String(e);
+    }
 
     // Post-extraction: detect swapped quantity / energyContent.
     // SAF energy density is ~33 MJ/litre = ~33,000 MJ/m3.
