@@ -4806,7 +4806,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         if (error) throw error;
         const blobUrl = URL.createObjectURL(data);
         setPdfPreview((prev) => {
-          if (prev?.url) URL.revokeObjectURL(prev.url);
+          if (prev?.url?.startsWith("blob:")) URL.revokeObjectURL(prev.url);
           return { title: title || "PDF", url: blobUrl };
         });
         addLog(`Opened PDF preview for ${title || "document"}`, "success");
@@ -5512,7 +5512,7 @@ export default function SAFManager({ onLogout, userEmail }) {
                   className="btn"
                   onClick={() =>
                     setPdfPreview((prev) => {
-                      if (prev?.url) URL.revokeObjectURL(prev.url);
+                      if (prev?.url?.startsWith("blob:")) URL.revokeObjectURL(prev.url);
                       return null;
                     })
                   }
