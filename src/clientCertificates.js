@@ -4,6 +4,47 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? Number(parsed.toFixed(6)) : null;
 }
 
+function weightedAverage(entries) {
+  let totalWeight = 0;
+  let weightedSum = 0;
+  for (const { value, weight } of entries) {
+    const v = toNumber(value);
+    const w = toNumber(weight);
+    if (v === null || w === null || w <= 0) continue;
+    weightedSum += v * w;
+    totalWeight += w;
+  }
+  if (totalWeight <= 0) return null;
+  return Number((weightedSum / totalWeight).toFixed(6));
+}
+
+function aggregateStringField(values) {
+  const unique = [...new Set(values.map((v) => String(v ?? "").trim()).filter(Boolean))];
+  if (unique.length === 0) return "";
+  if (unique.length > 3) return "Mixed";
+  return unique.join(", ");
+}
+
+function aggregateYesNo(values) {
+  const normalized = values
+    .map((v) => String(v ?? "").trim().toLowerCase())
+    .filter(Boolean);
+  if (normalized.length === 0) return "";
+  if (normalized.every((v) => v.startsWith("y"))) return "Yes";
+  if (normalized.every((v) => v.startsWith("n"))) return "No";
+  return "Mixed";
+}
+
+function earliestDate(values) {
+  const dates = values.map((v) => toDateOnly(v)).filter(Boolean).sort();
+  return dates[0] || "";
+}
+
+function latestDate(values) {
+  const dates = values.map((v) => toDateOnly(v)).filter(Boolean).sort();
+  return dates[dates.length - 1] || "";
+}
+
 function toMonthKey(value) {
   const text = String(value ?? "").trim();
   if (/^\d{4}-\d{2}$/.test(text)) return text;
@@ -131,6 +172,8 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
           _certificateIds: new Set(),
           _invoiceRowIds: new Set(),
           _linkIds: new Set(),
+          _isccContributions: [],
+          _dispatchDates: [],
         };
 
       if (!clientName) existing.validation_errors.push("Missing client name on approved allocation.");
@@ -159,6 +202,29 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
         existing.matched_row_count += 1;
       }
 
+      const data = cert?.data || {};
+      const sourceVolume = toNumber(data.quantity);
+      const sourceEnergy = toNumber(data.energyContent);
+      let mjPerM3 =
+        sourceVolume && sourceVolume > 0 && sourceEnergy !== null
+          ? sourceEnergy / sourceVolume
+          : null;
+      // Sanity-check: SAF energy density is ~33,000-35,000 MJ/m3. If the ratio
+      // is clearly outside a plausible range (e.g. source stored energyContent
+      // as a per-kg rate or in GJ), drop it rather than show a bogus value.
+      if (mjPerM3 !== null && (mjPerM3 < 10000 || mjPerM3 > 100000)) {
+        mjPerM3 = null;
+      }
+
+      existing._isccContributions.push({
+        weight: allocatedSaf,
+        data,
+        mjPerM3,
+      });
+
+      const dispatchDate = toDateOnly(invoiceRow?.uplift_date || link.uplift_date || "");
+      if (dispatchDate) existing._dispatchDates.push(dispatchDate);
+
       groups.set(groupKey, existing);
     }
   }
@@ -168,6 +234,59 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
       const validationErrors = [...new Set(group.validation_errors.filter(Boolean))];
       if (!group.source_certificate_refs.length) validationErrors.push("Missing source supplier certificate references.");
       if (!(group.total_saf_volume_m3 > 0)) validationErrors.push("Approved SAF volume must be greater than 0.");
+
+      const contribs = group._isccContributions;
+      const weightedFor = (field) =>
+        weightedAverage(contribs.map((c) => ({ value: c.data?.[field], weight: c.weight })));
+      const stringsFor = (field) => contribs.map((c) => c.data?.[field]);
+
+      const ghgTotal = weightedFor("ghgTotal");
+      const ghgEec = weightedFor("ghgEec");
+      const ghgEl = weightedFor("ghgEl");
+      const ghgEp = weightedFor("ghgEp");
+      const ghgEtd = weightedFor("ghgEtd");
+      const ghgEu = weightedFor("ghgEu");
+      const ghgEccs = weightedFor("ghgEccs");
+
+      const totalEnergyMj = contribs.reduce((acc, c) => {
+        if (c.mjPerM3 === null || !(c.weight > 0)) return acc;
+        return acc + c.weight * c.mjPerM3;
+      }, 0);
+      const energyMjPerM3 = weightedAverage(
+        contribs.map((c) => ({ value: c.mjPerM3, weight: c.weight }))
+      );
+
+      const safTypeAgg = aggregateStringField(stringsFor("safType"));
+      const productTypeAgg = aggregateStringField(stringsFor("productType"));
+      const iscc = {
+        // Prefer safType (HEFA, AtJ, FT) since productType on PoC docs is often
+        // "JETA1" (the final blended jet fuel) rather than the SAF product.
+        product_type: safTypeAgg || productTypeAgg,
+        product_type_raw: productTypeAgg,
+        saf_type: safTypeAgg,
+        raw_material: aggregateStringField(stringsFor("rawMaterial")),
+        raw_material_origin: aggregateStringField(stringsFor("rawMaterialOrigin")),
+        production_country: aggregateStringField(stringsFor("productionCountry")),
+        production_start_date: earliestDate(stringsFor("productionStartDate")),
+        eu_red_compliant: aggregateYesNo(stringsFor("euRedCompliant")),
+        iscc_compliant: aggregateYesNo(stringsFor("isccCompliant")),
+        chain_of_custody: aggregateStringField(stringsFor("chainOfCustody")),
+        energy_mj_per_m3: energyMjPerM3,
+        energy_total_mj: totalEnergyMj > 0 ? Number(totalEnergyMj.toFixed(2)) : null,
+        ghg_total: ghgTotal,
+        ghg_eec: ghgEec,
+        ghg_el: ghgEl,
+        ghg_ep: ghgEp,
+        ghg_etd: ghgEtd,
+        ghg_eu: ghgEu,
+        ghg_eccs: ghgEccs,
+        ghg_saving_percent:
+          ghgTotal === null ? null : Number((((94 - ghgTotal) / 94) * 100).toFixed(2)),
+        fossil_comparator: 94,
+        dispatch_date_min: earliestDate(group._dispatchDates),
+        dispatch_date_max: latestDate(group._dispatchDates),
+        supplier_cert_numbers: [...group.source_certificate_refs],
+      };
 
       return {
         group_key: group.group_key,
@@ -186,6 +305,7 @@ export function collectApprovedClientCertificateGroups(certs, invoiceRows, issue
         source_link_ids: group.source_link_ids,
         approved_link_count: group.approved_link_count,
         matched_row_count: group.matched_row_count,
+        iscc,
         validation_errors: validationErrors,
         can_generate: validationErrors.length === 0,
       };

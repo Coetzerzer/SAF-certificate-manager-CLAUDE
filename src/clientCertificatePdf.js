@@ -1,254 +1,178 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import {
   formatClientCertificateDate,
-  formatClientCertificateMonth,
   formatClientCertificateVolume,
 } from "./clientCertificates.js";
 
-const PAGE = {
-  width: 842,
-  height: 595,
-  margin: 42,
-};
+const templateUrl = new URL("./assets/iscc-pos-template.pdf", import.meta.url).href;
 
 function sanitizeForPdf(text) {
   return String(text ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function drawLabelValue(page, font, boldFont, x, y, label, value, options = {}) {
-  const labelWidth = options.labelWidth ?? 180;
-  const valueWidth = options.valueWidth ?? 220;
-  page.drawText(label, {
-    x,
-    y,
-    font,
-    size: 9,
-    color: rgb(0.31, 0.50, 0.63),
-  });
-  page.drawText(sanitizeForPdf(value), {
-    x: x + labelWidth,
-    y,
-    font: options.bold ? boldFont : font,
-    size: options.size ?? 10,
-    color: options.color ?? rgb(0.09, 0.15, 0.22),
-    maxWidth: valueWidth,
-    lineHeight: 12,
-  });
+function formatNumberOrEmpty(value, decimals = 2) {
+  if (value === null || value === undefined || value === "") return "";
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "";
+  return num.toFixed(decimals);
 }
 
+function formatDateIso(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
+  const [y, m, d] = text.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function formatDispatchRange(min, max) {
+  const low = formatDateIso(min);
+  const high = formatDateIso(max);
+  if (!low && !high) return "";
+  if (!high || low === high) return low;
+  return `${low} - ${high}`;
+}
+
+const TEXT_BLACK = rgb(0, 0, 0);
+const WHITE = rgb(1, 1, 1);
+
 export async function generateClientCertificatePdf(group) {
-  const pdf = await PDFDocument.create();
-  const page = pdf.addPage([PAGE.width, PAGE.height]);
+  const bytes = await fetch(templateUrl).then((res) => res.arrayBuffer());
+  const pdf = await PDFDocument.load(bytes);
+  const pages = pdf.getPages();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
-  const boldFont = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
 
-  page.drawRectangle({
-    x: 0,
-    y: PAGE.height - 64,
-    width: PAGE.width,
-    height: 64,
-    color: rgb(0.02, 0.10, 0.20),
-  });
-
-  page.drawText("TITAN AVIATION FUELS SARL", {
-    x: PAGE.margin,
-    y: PAGE.height - 34,
-    font: boldFont,
-    size: 18,
-    color: rgb(0.00, 0.75, 1.00),
-  });
-
-  page.drawText("Proof of Sustainability (PoS) Customer Allocation Certificate", {
-    x: PAGE.margin,
-    y: PAGE.height - 54,
-    font,
-    size: 10,
-    color: rgb(0.83, 0.90, 0.95),
-  });
-
-  page.drawRectangle({
-    x: PAGE.margin,
-    y: PAGE.height - 142,
-    width: PAGE.width - PAGE.margin * 2,
-    height: 54,
-    borderWidth: 1,
-    borderColor: rgb(0.05, 0.19, 0.38),
-  });
-
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, PAGE.height - 108, "Certificate Number", group.internal_reference, {
-    bold: true,
-    labelWidth: 120,
-    valueWidth: 220,
-  });
-  drawLabelValue(page, font, boldFont, PAGE.margin + 420, PAGE.height - 108, "Issue Date", formatClientCertificateDate(group.issue_date), {
-    bold: true,
-    labelWidth: 70,
-    valueWidth: 100,
-  });
-
-  const leftX = PAGE.margin;
-  const topY = PAGE.height - 174;
-  const columnWidth = (PAGE.width - PAGE.margin * 2 - 16) / 2;
-  const boxHeight = group.client_address ? 124 : 108;
-
-  page.drawRectangle({
-    x: leftX,
-    y: topY - boxHeight,
-    width: columnWidth,
-    height: boxHeight,
-    borderWidth: 1,
-    borderColor: rgb(0.05, 0.19, 0.38),
-  });
-  page.drawRectangle({
-    x: leftX + columnWidth + 16,
-    y: topY - boxHeight,
-    width: columnWidth,
-    height: boxHeight,
-    borderWidth: 1,
-    borderColor: rgb(0.05, 0.19, 0.38),
-  });
-
-  page.drawText("Supplier", {
-    x: leftX + 14,
-    y: topY - 18,
-    font: boldFont,
-    size: 10,
-    color: rgb(0.00, 0.75, 1.00),
-  });
-  page.drawText("Recipient", {
-    x: leftX + columnWidth + 30,
-    y: topY - 18,
-    font: boldFont,
-    size: 10,
-    color: rgb(0.00, 0.75, 1.00),
-  });
-
-  drawLabelValue(page, font, boldFont, leftX + 14, topY - 40, "Name", "Titan Aviation Fuels SARL", {
-    bold: true,
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-  });
-  drawLabelValue(page, font, boldFont, leftX + 14, topY - 60, "Address", "8 rue du Bois-du-Lan, 1217 Meyrin, Switzerland", {
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-    size: 9,
-  });
-  drawLabelValue(page, font, boldFont, leftX + 14, topY - 80, "System", "ISCC EU", {
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-  });
-
-  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - 40, "Name", group.client_name, {
-    bold: true,
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-  });
-  if (group.client_address) {
-    drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - 56, "Address", group.client_address, {
-      labelWidth: 60,
-      valueWidth: columnWidth - 90,
-      size: 8,
+  const draw = (pageIndex, text, x, y, opts = {}) => {
+    const value = sanitizeForPdf(text);
+    if (!value) return;
+    const page = pages[pageIndex];
+    if (!page) return;
+    page.drawText(value, {
+      x,
+      y,
+      font: opts.bold ? bold : font,
+      size: opts.size ?? 9,
+      color: opts.color ?? TEXT_BLACK,
+      maxWidth: opts.maxWidth,
+      lineHeight: opts.lineHeight ?? 11,
     });
+  };
+
+  // Apply a compliance tick (EU RED / ISCC). When defaultTicked is true, the template
+  // already draws a ⊠; we cover it with a white rectangle for "No"/"Mixed".
+  // When defaultTicked is false, we draw an X for "Yes" (leave blank for No/Mixed).
+  const applyComplianceTick = (pageIndex, value, y, defaultTicked) => {
+    const yesX = 212;
+    if (value === "Yes" && !defaultTicked) {
+      draw(pageIndex, "X", yesX, y, { bold: true, size: 10 });
+    } else if ((value === "No" || value === "Mixed") && defaultTicked) {
+      pages[pageIndex].drawRectangle({
+        x: yesX - 3, y: y - 2, width: 14, height: 13, color: WHITE,
+      });
+    }
+  };
+
+  const iscc = group.iscc || {};
+
+  // --- Page 0 ---
+  // Top block: unique number & issue date (black to match other filled values).
+  draw(0, group.internal_reference, 230, 605, { bold: true, size: 9, maxWidth: 210 });
+  draw(0, formatClientCertificateDate(group.issue_date), 230, 580);
+
+  // Supplier block — Name and Address are large merged boxes.
+  draw(0, "Titan Aviation Fuels SARL", 140, 540, { bold: true, maxWidth: 150 });
+  draw(0, "8 rue du Bois-du-Lan, 1217 Meyrin, Switzerland", 145, 495, {
+    size: 8,
+    maxWidth: 150,
+    lineHeight: 10,
+  });
+  // Supplier certificate number: sits in the merged input below the label (row 18).
+  // Shrink font only when the ref is long enough to need it.
+  const certStr = (iscc.supplier_cert_numbers || []).join(", ");
+  const certSize = certStr.length > 35 ? 7 : 9;
+  draw(0, certStr, 100, 443, {
+    size: certSize,
+    maxWidth: 195,
+    lineHeight: certSize + 1,
+  });
+
+  // Recipient block
+  draw(0, group.client_name, 345, 540, { bold: true, maxWidth: 170 });
+  if (group.client_address) {
+    draw(0, group.client_address, 350, 495, { size: 8, maxWidth: 165, lineHeight: 10 });
   }
-  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - (group.client_address ? 76 : 60), "Airport", group.airport_code, {
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-  });
-  drawLabelValue(page, font, boldFont, leftX + columnWidth + 30, topY - (group.client_address ? 92 : 80), "Period", formatClientCertificateMonth(group.month), {
-    labelWidth: 60,
-    valueWidth: columnWidth - 90,
-  });
 
-  const summaryY = topY - boxHeight - 16;
-  page.drawRectangle({
-    x: PAGE.margin,
-    y: summaryY - 118,
-    width: PAGE.width - PAGE.margin * 2,
-    height: 118,
-    borderWidth: 1,
-    borderColor: rgb(0.05, 0.19, 0.38),
-  });
+  // Addresses of dispatch/receipt.
+  // We write a custom receipt address, so cover the template's default ⊠ on
+  // "Same as address of recipient" to avoid a contradictory state. Visual
+  // calibration (via debug PDF): ⊠ glyph sits at PDF (~213, ~376).
+  pages[0].drawRectangle({ x: 206, y: 370, width: 16, height: 14, color: WHITE });
+  draw(0, `Airport ${group.airport_code || ""}`, 230, 383);
+  draw(0, formatDispatchRange(iscc.dispatch_date_min, iscc.dispatch_date_max), 230, 348);
 
-  page.drawText("Approved SAF Allocation Summary", {
-    x: PAGE.margin + 14,
-    y: summaryY - 18,
-    font: boldFont,
-    size: 11,
-    color: rgb(0.00, 0.75, 1.00),
-  });
+  // General information
+  draw(0, iscc.product_type, 230, 311, { maxWidth: 260 });
+  draw(0, iscc.raw_material, 230, 295, { maxWidth: 260 });
+  draw(0, group.month_label || "", 230, 279, { maxWidth: 260 });
+  draw(0, iscc.raw_material_origin, 230, 261, { maxWidth: 260 });
 
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, summaryY - 44, "Customer", group.client_name, {
-    labelWidth: 120,
-    valueWidth: 260,
-  });
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, summaryY - 64, "Airport", group.airport_code, {
-    labelWidth: 120,
-    valueWidth: 120,
-  });
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, summaryY - 84, "Period", formatClientCertificateMonth(group.month), {
-    labelWidth: 120,
-    valueWidth: 160,
-  });
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, summaryY - 104, "SAF Volume", `${formatClientCertificateVolume(group.total_saf_volume_m3)} m3`, {
+  // Quantity + Energy. Template already ticks ⊠ m³ by default, so no overlay needed.
+  draw(0, formatClientCertificateVolume(group.total_saf_volume_m3), 250, 246, {
     bold: true,
-    labelWidth: 120,
-    valueWidth: 140,
-    color: rgb(0.00, 0.58, 0.31),
+    size: 10,
   });
-
-  const sourcesY = summaryY - 150;
-  page.drawRectangle({
-    x: PAGE.margin,
-    y: sourcesY - 116,
-    width: PAGE.width - PAGE.margin * 2,
-    height: 116,
-    borderWidth: 1,
-    borderColor: rgb(0.05, 0.19, 0.38),
-  });
-
-  page.drawText("Traceability", {
-    x: PAGE.margin + 14,
-    y: sourcesY - 18,
-    font: boldFont,
-    size: 11,
-    color: rgb(0.00, 0.75, 1.00),
-  });
-
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, sourcesY - 44, "Approved linked rows", String(group.matched_row_count), {
-    labelWidth: 140,
-    valueWidth: 60,
-  });
-  drawLabelValue(page, font, boldFont, PAGE.margin + 14, sourcesY - 64, "Approved link records", String(group.approved_link_count), {
-    labelWidth: 140,
-    valueWidth: 60,
-  });
-  drawLabelValue(
-    page,
-    font,
-    boldFont,
-    PAGE.margin + 14,
-    sourcesY - 96,
-    "Source Certificates",
-    (group.source_certificate_refs || []).join(", "),
-    {
-      labelWidth: 140,
-      valueWidth: PAGE.width - PAGE.margin * 2 - 170,
-      size: 9,
-    }
+  draw(
+    0,
+    iscc.energy_total_mj ? Math.round(iscc.energy_total_mj).toString() : "",
+    230,
+    230,
+    { bold: true },
   );
 
-  page.drawText(
-    "This customer certificate reflects only approved SAF allocations. SAF volume is calculated from approved allocated links and is not derived from the supplier certificate total.",
-    {
-      x: PAGE.margin,
-      y: 42,
-      font,
-      size: 9,
-      color: rgb(0.31, 0.50, 0.63),
-      maxWidth: PAGE.width - PAGE.margin * 2,
-      lineHeight: 12,
-    }
-  );
+  // Compliance ticks. Template defaults: EU RED ⊠ Yes, ISCC ⬜ Yes.
+  applyComplianceTick(0, iscc.eu_red_compliant, 216, true);
+  applyComplianceTick(0, iscc.iscc_compliant, 203, false);
+
+  draw(0, iscc.chain_of_custody, 280, 185, { maxWidth: 200 });
+  draw(0, iscc.production_country, 230, 170, { maxWidth: 260 });
+  draw(0, formatDateIso(iscc.production_start_date), 230, 151);
+
+  // --- Page 1 ---
+  // Scope of certification — template default is already ⊠ Yes, no overlay needed.
+
+  // GHG emission values. Fill missing components with "0.00" so the formula
+  // E = Ei + Ep + Etd + Eu − Eccs visibly reconciles with the total.
+  const hasAnyGhg =
+    iscc.ghg_total !== null && iscc.ghg_total !== undefined;
+  const ghgCell = (v) => (hasAnyGhg ? formatNumberOrEmpty(v, 2) || "0.00" : "");
+  draw(1, ghgCell(iscc.ghg_eec), 122, 437);
+  draw(1, ghgCell(iscc.ghg_ep), 158, 437);
+  draw(1, ghgCell(iscc.ghg_etd), 200, 437);
+  draw(1, ghgCell(iscc.ghg_eu), 240, 437);
+  draw(1, ghgCell(iscc.ghg_eccs), 275, 437);
+  // Total E (right side near "=" sign). Cover the template's "0" placeholder first.
+  if (hasAnyGhg) {
+    pages[1].drawRectangle({
+      x: 428, y: 434, width: 30, height: 13, color: WHITE,
+    });
+    draw(1, formatNumberOrEmpty(iscc.ghg_total, 2), 430, 437, { bold: true });
+  }
+
+  // Ei breakdown (row y ~ 403). Leave blank when source data is unavailable.
+  draw(1, formatNumberOrEmpty(iscc.ghg_eec, 2), 92, 403);
+  draw(1, formatNumberOrEmpty(iscc.ghg_el, 2), 145, 403);
+
+  // GHG saving % — overwrite the "100,0%" placeholder.
+  const savingText =
+    iscc.ghg_saving_percent === null || iscc.ghg_saving_percent === undefined
+      ? ""
+      : `${Number(iscc.ghg_saving_percent).toFixed(1)}%`;
+  if (savingText) {
+    pages[1].drawRectangle({
+      x: 108, y: 353, width: 32, height: 11, color: WHITE,
+    });
+    draw(1, savingText, 112, 355, { bold: true });
+  }
 
   return pdf.save();
 }

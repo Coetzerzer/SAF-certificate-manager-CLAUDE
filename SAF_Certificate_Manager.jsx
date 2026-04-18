@@ -3071,9 +3071,9 @@ function DashboardTab({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
     <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
       {/* KPIs */}
       <div style={{ display: "flex", gap: 1, background: "#030d1a", borderRadius: 8, border: "1px solid #0d2040", marginBottom: 24, overflow: "hidden" }}>
-        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00bfff" }}>{data.totalCertVolume.toFixed(2)}</div><div style={kpiLabel}>CERTIFIED M³</div></div>
-        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00ff9d" }}>{data.totalAllocated.toFixed(2)}</div><div style={kpiLabel}>ALLOCATED M³</div></div>
-        <div style={kpiStyle}><div style={{ ...kpiVal, color: data.gap > 0.01 ? "#ff6666" : "#00ff9d" }}>{data.gap.toFixed(2)}</div><div style={kpiLabel}>GAP M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00bfff" }}>{data.totalCertVolume.toFixed(3)}</div><div style={kpiLabel}>CERTIFIED M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00ff9d" }}>{data.totalAllocated.toFixed(3)}</div><div style={kpiLabel}>ALLOCATED M³</div></div>
+        <div style={kpiStyle}><div style={{ ...kpiVal, color: data.gap > 0.01 ? "#ff6666" : "#00ff9d" }}>{data.gap.toFixed(3)}</div><div style={kpiLabel}>GAP M³</div></div>
         <div style={kpiStyle}><div style={{ ...kpiVal, color: covColor }}>{data.coveragePercent.toFixed(1)}%</div><div style={kpiLabel}>COVERAGE</div></div>
         <div style={kpiStyle}><div style={{ ...kpiVal, color: "#00ff9d" }}>{data.certsOk}</div><div style={kpiLabel}>CERTS OK</div></div>
         <div style={{ ...kpiStyle, borderRight: "none" }}><div style={{ ...kpiVal, color: data.certsAttention > 0 ? "#ff9933" : "#00ff9d" }}>{data.certsAttention}</div><div style={kpiLabel}>NEED ATTENTION</div></div>
@@ -3100,8 +3100,8 @@ function DashboardTab({ certs, invoiceRows, onSelectCert, onSwitchTab }) {
                     return (
                       <td key={m} style={{ padding: "6px 8px", textAlign: "center" }}
                         title={cell ? `Cert: ${cell.certVolume.toFixed(3)} m³\nAllocated: ${cell.allocatedVolume.toFixed(3)} m³\nGap: ${(cell.certVolume - cell.allocatedVolume).toFixed(3)} m³${cell.hasNoUplift ? "\n(no Titan uplift at this airport/month)" : ""}` : "No certificate"}>
-                        <span style={{ display: "inline-block", padding: "3px 8px", borderRadius: 4, background: bg, color: fg, fontSize: 9, fontWeight: 700, minWidth: 50 }}>
-                          {cell ? `${cell.allocatedVolume.toFixed(2)}` : "—"}
+                        <span style={{ display: "inline-block", padding: "3px 8px", borderRadius: 4, background: bg, color: fg, fontSize: 9, fontWeight: 700, minWidth: 58 }}>
+                          {cell ? `${cell.allocatedVolume.toFixed(3)}` : "—"}
                         </span>
                       </td>
                     );
