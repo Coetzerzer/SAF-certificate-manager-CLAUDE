@@ -2920,6 +2920,259 @@ function MatchRowsTable({ rows, title = "LINKED INVOICE ROWS", emptyText = "No l
   );
 }
 
+function ManualMatchPanel({ cert, invoiceRows, loading, onSave }) {
+  const certVol = Number(cert?.match?.cert_volume_m3) || Number(cert?.data?.quantity) || 0;
+  const existingAllocated = Number(cert?.match?.allocated_volume_m3) || 0;
+
+  const defaultAirport = (() => {
+    const candidates = [
+      ...(cert?.data?.canonicalAirports || []),
+      ...(cert?.data?.airports || []),
+      ...(cert?.match?.diagnostics?.resolved_airports || []),
+    ];
+    for (const a of candidates) {
+      const code = (a?.iata || a?.icao || (typeof a === "string" ? a : "") || "").toUpperCase();
+      if (code && /^[A-Z]{3,4}$/.test(code)) return code;
+    }
+    return "";
+  })();
+  const defaultMonth = (() => {
+    const candidates = [cert?.match?.diagnostics?.coverage_month, cert?.data?.coverageMonth, cert?.data?.supplyPeriodStart];
+    for (const c of candidates) {
+      if (typeof c === "string" && /^\d{4}-\d{2}/.test(c)) return c.slice(0, 7);
+    }
+    return "";
+  })();
+
+  const [airportFilter, setAirportFilter] = useState(defaultAirport);
+  const [monthFilter, setMonthFilter] = useState(defaultMonth);
+  const [supplierFilter, setSupplierFilter] = useState("");
+  const [searchText, setSearchText] = useState("");
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setAirportFilter(defaultAirport);
+    setMonthFilter(defaultMonth);
+    setSupplierFilter("");
+    setSearchText("");
+    setSelectedIds(new Set());
+  }, [cert?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const existingLinkRowIds = new Set((cert?.match?.links || []).map((l) => l.invoice_row_id).filter(Boolean));
+
+  const getRowMonth = (row) => {
+    if (!row?.uplift_date) return null;
+    const d = new Date(row.uplift_date);
+    if (isNaN(d)) return null;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  };
+  const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+  const searchLower = searchText.toLowerCase();
+  const availableRows = (invoiceRows || []).filter((row) => {
+    if (existingLinkRowIds.has(row.id)) return false;
+    if (!(Number(row.remaining_m3) > MATCH_TOLERANCE)) return false;
+    if (airportFilter && row.iata !== airportFilter) return false;
+    if (monthFilter && getRowMonth(row) !== monthFilter) return false;
+    if (supplierFilter && row.supplier !== supplierFilter) return false;
+    if (searchLower && !(row.customer || "").toLowerCase().includes(searchLower) && !(row.invoice_no || "").toLowerCase().includes(searchLower)) return false;
+    return true;
+  });
+
+  const uniqueAirports = [...new Set((invoiceRows || []).map((r) => r.iata).filter((a) => a && /^[A-Z]{3,4}$/.test(a)))].sort();
+  const uniqueMonths = [...new Set((invoiceRows || []).map((r) => getRowMonth(r)).filter(Boolean))].sort();
+  const uniqueSuppliers = [...new Set((invoiceRows || []).map((r) => r.supplier).filter(Boolean))].sort();
+
+  const selectedRows = availableRows.filter((r) => selectedIds.has(r.id));
+  const selectedVolume = selectedRows.reduce((sum, r) => sum + (Number(r.remaining_m3) || 0), 0);
+  const projected = existingAllocated + selectedVolume;
+
+  let volumeColor = "#c8dff0";
+  if (selectedVolume > 0) {
+    if (projected > certVol + MATCH_TOLERANCE) volumeColor = "#ffbb00";
+    else if (projected >= certVol - MATCH_TOLERANCE) volumeColor = "#00ff9d";
+    else volumeColor = "#ff9933";
+  }
+
+  const toggleRow = (id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleSave = async () => {
+    if (!selectedIds.size || saving) return;
+    try {
+      setSaving(true);
+      await onSave([...selectedIds]);
+      setSelectedIds(new Set());
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const hasFilters = airportFilter || monthFilter || supplierFilter || searchText;
+  const inputStyle = {
+    background: "#0a1628",
+    color: "#c8dff0",
+    border: "1px solid #0d3060",
+    borderRadius: 6,
+    padding: "6px 10px",
+    fontSize: 11,
+    fontFamily: "'Space Mono', monospace",
+  };
+
+  return (
+    <div style={{ background: "#060e1a", borderRadius: 8, padding: 16, border: "1px solid #0d2040", marginTop: 12 }}>
+      <div style={{ color: "#00bfff", fontFamily: "'Space Mono', monospace", fontSize: 10, marginBottom: 10, letterSpacing: 1 }}>
+        MANUAL MATCH — BROWSE & LINK INVOICE ROWS
+      </div>
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+        <select value={airportFilter} onChange={(e) => setAirportFilter(e.target.value)} style={inputStyle}>
+          <option value="">All airports</option>
+          {uniqueAirports.map((a) => (
+            <option key={a} value={a}>
+              {a}
+            </option>
+          ))}
+        </select>
+        <select value={monthFilter} onChange={(e) => setMonthFilter(e.target.value)} style={inputStyle}>
+          <option value="">All months</option>
+          {uniqueMonths.map((m) => {
+            const [y, mo] = m.split("-");
+            return (
+              <option key={m} value={m}>
+                {monthNames[Number(mo) - 1]} {y}
+              </option>
+            );
+          })}
+        </select>
+        <select value={supplierFilter} onChange={(e) => setSupplierFilter(e.target.value)} style={inputStyle}>
+          <option value="">All suppliers</option>
+          {uniqueSuppliers.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+        <input
+          type="text"
+          placeholder="Search customer or invoice..."
+          value={searchText}
+          onChange={(e) => setSearchText(e.target.value)}
+          style={{ ...inputStyle, width: 220 }}
+        />
+        {hasFilters ? (
+          <button
+            onClick={() => {
+              setAirportFilter("");
+              setMonthFilter("");
+              setSupplierFilter("");
+              setSearchText("");
+            }}
+            style={{
+              background: "#0a1628",
+              color: "#4a9fd4",
+              border: "1px solid #0d3060",
+              borderRadius: 6,
+              padding: "6px 12px",
+              fontSize: 10,
+              fontFamily: "'Space Mono', monospace",
+              letterSpacing: 1,
+              cursor: "pointer",
+            }}
+          >
+            CLEAR FILTERS
+          </button>
+        ) : null}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 10, fontFamily: "'Space Mono', monospace", fontSize: 11, flexWrap: "wrap" }}>
+        <span style={{ color: "#4a7fa0" }}>
+          <span style={{ color: "#00bfff" }}>{selectedIds.size}</span> selected · <span style={{ color: "#00bfff" }}>{availableRows.length}</span> available
+        </span>
+        <span style={{ color: "#4a7fa0" }}>
+          Selected volume: <span style={{ color: volumeColor, fontWeight: 700 }}>{formatVolume(selectedVolume)} m³</span>
+        </span>
+        <span style={{ color: "#4a7fa0" }}>
+          After save: <span style={{ color: volumeColor, fontWeight: 700 }}>{formatVolume(projected)} / {formatVolume(certVol)} m³</span>
+        </span>
+        <button
+          onClick={handleSave}
+          disabled={!selectedIds.size || saving || !!loading}
+          style={{
+            marginLeft: "auto",
+            background: selectedIds.size && !saving && !loading ? "#003322" : "#0a1628",
+            color: selectedIds.size && !saving && !loading ? "#00ff9d" : "#4a7fa0",
+            padding: "8px 20px",
+            borderRadius: 6,
+            fontFamily: "'Space Mono', monospace",
+            fontSize: 11,
+            fontWeight: 700,
+            letterSpacing: 1,
+            border: `1px solid ${selectedIds.size && !saving && !loading ? "#00ff9d44" : "#0d3060"}`,
+            cursor: selectedIds.size && !saving && !loading ? "pointer" : "not-allowed",
+          }}
+        >
+          {saving ? "SAVING..." : "SAVE MANUAL MATCH"}
+        </button>
+      </div>
+
+      {!availableRows.length ? (
+        <div style={{ color: "#4a7fa0", fontSize: 11, padding: 20, textAlign: "center" }}>
+          No invoice rows match current filters (only rows with remaining volume are shown).
+        </div>
+      ) : (
+        <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto", border: "1px solid #0d2040", borderRadius: 6 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "'Space Mono', monospace", fontSize: 10 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #0d3060", background: "#0a1628", position: "sticky", top: 0 }}>
+                {["PICK", "CSV ROW", "INVOICE", "CUSTOMER", "UPLIFT DATE", "IATA", "SUPPLIER", "REMAINING M3"].map((h) => (
+                  <th key={h} style={{ padding: "6px 10px", textAlign: "left", color: "#00bfff", whiteSpace: "nowrap" }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {availableRows.map((row, i) => {
+                const isChecked = selectedIds.has(row.id);
+                return (
+                  <tr
+                    key={row.id}
+                    onClick={() => toggleRow(row.id)}
+                    style={{
+                      borderBottom: "1px solid #0d2040",
+                      background: isChecked ? "#0a2040" : i % 2 === 0 ? "#060e1a" : "#030d1a",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <td style={{ padding: "6px 10px" }}>
+                      <input type="checkbox" checked={isChecked} onChange={() => toggleRow(row.id)} onClick={(e) => e.stopPropagation()} />
+                    </td>
+                    <td style={{ padding: "6px 10px", color: "#4a9fd4" }}>{row.row_number}</td>
+                    <td style={{ padding: "6px 10px", color: "#e0f0ff" }}>{row.invoice_no || "—"}</td>
+                    <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.customer || "—"}</td>
+                    <td style={{ padding: "6px 10px", color: "#888" }}>{row.uplift_date || "—"}</td>
+                    <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.iata || "—"}</td>
+                    <td style={{ padding: "6px 10px", color: "#c8dff0" }}>{row.supplier || "—"}</td>
+                    <td style={{ padding: "6px 10px", color: "#00ff9d", fontWeight: 700 }}>{formatVolume(row.remaining_m3)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function monthFromPeriodStart(value) {
   if (typeof value !== "string") return null;
   const m = value.match(/^(\d{4})-(\d{2})/);
@@ -4457,6 +4710,99 @@ export default function SAFManager({ onLogout, userEmail }) {
     [clearCertificateMatch, insertCertificateInvoiceLinks, syncAllocationUnitConsumption]
   );
 
+  const saveManualMatch = useCallback(
+    async (certificate, selectedRowIds) => {
+      if (!certificate?.id || !selectedRowIds?.length) return;
+      if (loading) {
+        addLog("Another operation is in progress. Please wait.", "error");
+        return;
+      }
+      setLoading("Saving manual match...");
+      try {
+        const idSet = new Set(selectedRowIds);
+        const newLinkedRows = invoiceRows
+          .filter((r) => idSet.has(r.id) && Number(r.remaining_m3) > MATCH_TOLERANCE)
+          .map((r) => ({
+            invoice_row_id: r.id,
+            row_number: r.row_number,
+            invoice_no: r.invoice_no,
+            customer: r.customer,
+            uplift_date: r.uplift_date,
+            iata: r.iata,
+            icao: r.icao,
+            allocated_m3: Number(r.remaining_m3),
+            allocation_unit_id: null,
+            allocation_unit_index: null,
+            allocation_unit_type: null,
+          }));
+
+        if (!newLinkedRows.length) {
+          addLog("No selectable invoice rows with remaining volume.", "error");
+          return;
+        }
+
+        const manuallyAdded = newLinkedRows.reduce((s, r) => s + Number(r.allocated_m3 || 0), 0);
+        const certVol = Number(certificate.match?.cert_volume_m3) || Number(certificate.data?.quantity) || 0;
+        const existingMatch = certificate.match;
+        const existingAllocated = Number(existingMatch?.allocated_volume_m3) || 0;
+        const existingLinks = Array.isArray(existingMatch?.links) ? existingMatch.links.length : 0;
+        const newAllocated = Number((existingAllocated + manuallyAdded).toFixed(6));
+        const nextStatus = newAllocated >= certVol - MATCH_TOLERANCE ? "approved" : "partial_linked";
+        const variance = Number((certVol - newAllocated).toFixed(6));
+        const note = existingLinks > 0
+          ? `Manually linked ${newLinkedRows.length} row(s) on top of ${existingLinks} auto-linked row(s).`
+          : `Manually linked ${newLinkedRows.length} invoice row(s).`;
+
+        const hasExistingMatchRow = !!existingMatch?.id;
+        const hasExistingLinks = existingLinks > 0;
+
+        if (!hasExistingMatchRow || !hasExistingLinks) {
+          await persistMatch(
+            certificate,
+            {
+              status: nextStatus,
+              match_method: "manual",
+              cert_volume_m3: certVol,
+              allocated_volume_m3: newAllocated,
+              variance_m3: variance,
+              review_note: note,
+              diagnostics: { ...(existingMatch?.diagnostics || {}), manual_link_count: newLinkedRows.length },
+              candidate_sets: existingMatch?.candidate_sets || [],
+              linked_rows: newLinkedRows,
+            },
+            userEmail
+          );
+        } else {
+          await insertCertificateInvoiceLinks(existingMatch.id, certificate.id, newLinkedRows);
+          const { error: updErr } = await supabase
+            .from("certificate_matches")
+            .update({
+              status: nextStatus,
+              match_method: "manual",
+              allocated_volume_m3: newAllocated,
+              variance_m3: variance,
+              review_note: note,
+              reviewed_by: userEmail || null,
+              reviewed_at: nextStatus === "approved" ? new Date().toISOString() : null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", existingMatch.id);
+          if (updErr) throw updErr;
+          await syncAllocationUnitConsumption(certificate.id);
+        }
+
+        addLog(`Manual match saved: ${newLinkedRows.length} row(s), ${manuallyAdded.toFixed(3)} m³ linked (status: ${nextStatus}).`, "ok");
+        await loadFromDB();
+      } catch (err) {
+        console.error(err);
+        addLog(`Manual match failed: ${err?.message || err}`, "error");
+      } finally {
+        setLoading("");
+      }
+    },
+    [invoiceRows, loading, addLog, persistMatch, insertCertificateInvoiceLinks, syncAllocationUnitConsumption, userEmail, loadFromDB]
+  );
+
   const handlePDFUpload = useCallback(
     async (files) => {
       const list = Array.from(files || []);
@@ -5322,9 +5668,16 @@ export default function SAFManager({ onLogout, userEmail }) {
     "—";
   const stats = {
     totalCerts: certs.length,
-    supported: certs.filter((cert) => cert.document_family === "supported_simple" || cert.data?.document_family === "supported_simple").length,
-    manualOnly: certs.filter((cert) => cert.document_family === "manual_only" || cert.data?.document_family === "manual_only").length,
+    supported: certs.filter((cert) => {
+      const fam = cert.document_family || cert.data?.document_family;
+      return fam === "supported_simple" || fam === "supported_poc";
+    }).length,
+    manualOnly: certs.filter((cert) => {
+      const fam = cert.document_family || cert.data?.document_family;
+      return fam === "manual_only";
+    }).length,
     matched: certs.filter((cert) => ["auto_linked", "approved"].includes(cert.match?.status)).length,
+    partialLinked: certs.filter((cert) => cert.match?.status === "partial_linked").length,
     unmatched: certs.filter((cert) => cert.match?.status === "unmatched").length,
     allocatedRows: invoiceRows.filter((row) => row.allocation_status === "allocated" || row.allocation_status === "partial").length,
   };
@@ -5742,8 +6095,9 @@ export default function SAFManager({ onLogout, userEmail }) {
         {[
           { label: "CERTS", val: stats.totalCerts, color: "#00bfff" },
           { label: "SUPPORTED", val: stats.supported, color: "#00ff9d" },
-          { label: "MANUAL ONLY", val: stats.manualOnly, color: "#ffbb00" },
           { label: "MATCHED", val: stats.matched, color: "#00ff9d" },
+          { label: "MANUAL ONLY", val: stats.manualOnly, color: "#ffbb00" },
+          { label: "PARTIAL", val: stats.partialLinked, color: "#ff9933" },
           { label: "UNMATCHED", val: stats.unmatched, color: "#ff6666" },
           { label: "ALLOCATED ROWS", val: stats.allocatedRows, color: "#4a9fd4" },
         ].map((item) => (
@@ -6117,6 +6471,19 @@ export default function SAFManager({ onLogout, userEmail }) {
                     <div style={{ gridColumn: "1 / -1" }}>
                       <MatchRowsTable rows={selectedCert.match?.links || []} title="LINKED INVOICE ROWS" />
                     </div>
+
+                    {(selectedCert.match?.status === "unmatched" ||
+                      selectedCert.match?.status === "partial_linked" ||
+                      !selectedCert.match) && (
+                      <div style={{ gridColumn: "1 / -1" }}>
+                        <ManualMatchPanel
+                          cert={selectedCert}
+                          invoiceRows={invoiceRows}
+                          loading={loading}
+                          onSave={(ids) => saveManualMatch(selectedCert, ids)}
+                        />
+                      </div>
+                    )}
 
                     {(selectedCert.match?.status === "auto_linked" || selectedCert.match?.status === "partial_linked") ? (
                       <div
