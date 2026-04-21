@@ -6474,6 +6474,7 @@ export default function SAFManager({ onLogout, userEmail }) {
 
                     {(selectedCert.match?.status === "unmatched" ||
                       selectedCert.match?.status === "partial_linked" ||
+                      selectedCert.match?.status === "manual_only" ||
                       !selectedCert.match) && (
                       <div style={{ gridColumn: "1 / -1" }}>
                         <ManualMatchPanel
