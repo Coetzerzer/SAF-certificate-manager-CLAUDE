@@ -545,6 +545,34 @@ function buildSupportedPocClassification(coverage, reasonParts) {
   });
 }
 
+function buildSupportedYearlyClassification(coverage, reasonParts) {
+  return buildClassification({
+    documentFamily: "supported_yearly",
+    matchingMode: "simple_yearly_airport",
+    supportedBoolean: true,
+    processingMode: "supported_yearly",
+    supportReason: reasonParts.join("; "),
+    coverage,
+  });
+}
+
+// Annual single-airport PoC without monthlyVolumes (e.g. Hellenic Fuels / EKO format).
+// Coverage is the full calendar year (Jan 1 → Dec 31), recipient must be present so
+// that the yearly allocator can FIFO-consume only that recipient's uplifts at the airport.
+function isYearlyPoCSingleAirport(data) {
+  const start = String(data?.coverageStart || "").trim();
+  const end = String(data?.coverageEnd || "").trim();
+  const startMatch = start.match(/^(\d{4})-01-01$/);
+  const endMatch = end.match(/^(\d{4})-12-31$/);
+  if (!startMatch || !endMatch || startMatch[1] !== endMatch[1]) return false;
+  const airports = collectCanonicalAirportEntries(data);
+  if (airports.length !== 1) return false;
+  const monthlyVolumes = Array.isArray(data?.monthlyVolumes) ? data.monthlyVolumes : [];
+  const airportVolumes = Array.isArray(data?.airportVolumes) ? data.airportVolumes : [];
+  if (monthlyVolumes.length > 0 || airportVolumes.length > 0) return false;
+  return true;
+}
+
 function isPocWithCanonicalizedMonthlyVolumes(data) {
   const volumes = data?.monthlyVolumes;
   if (!Array.isArray(volumes) || volumes.length < 1) return false;
@@ -626,6 +654,40 @@ export function deriveCertificateClassification(data, context = {}) {
       `${data.monthlyVolumes.length} airports with per-airport monthly volumes`,
       `total SAF volume (${totalVolume} m3)`,
       "all airport codes canonicalized",
+    ]);
+  }
+
+  // Annual single-airport PoC without monthlyVolumes (Hellenic Fuels / EKO format).
+  // Routed to recipient-scoped yearly FIFO allocation.
+  if (certKind === "poc" && isYearlyPoCSingleAirport(data)) {
+    const startYear = String(data?.coverageStart || "").slice(0, 4);
+    const coverage = {
+      coverageGranularity: "year",
+      coverageMonth: data?.coverageMonth || `${startYear}-12`,
+      coverageStart: data?.coverageStart || "",
+      coverageEnd: data?.coverageEnd || "",
+      coverageSource: "supply-period",
+      matchingEvidence: "supply-period-full-year",
+    };
+    const totalVolume = parseFlexibleNumber(data?.quantity);
+    const recipient = String(data?.recipient || "").trim();
+    const yearlyRejections = [];
+    if (!Number.isFinite(totalVolume) || totalVolume <= 0)
+      yearlyRejections.push("certificate SAF volume is unclear");
+    if (isNonM3Unit(data?.quantityUnit))
+      yearlyRejections.push(`quantity unit "${data.quantityUnit}" is not m³ — manual conversion required`);
+    if (!recipient)
+      yearlyRejections.push("recipient missing — required for yearly recipient-scoped allocation");
+    if (yearlyRejections.length) {
+      return buildManualOnlyClassification(coverage, ["Yearly PoC", ...yearlyRejections]);
+    }
+    const airportCode = getCanonicalAirportCodes(data)[0];
+    return buildSupportedYearlyClassification(coverage, [
+      "Yearly PoC",
+      `1 airport (${airportCode})`,
+      `full year ${startYear}`,
+      `total SAF ${totalVolume} m3`,
+      `recipient: ${recipient}`,
     ]);
   }
 

@@ -127,6 +127,18 @@ IMPORTANT RULES:
   - "coverageStart"/"coverageEnd": set to the first/last day of the SAF delivery month (from coverageMonth), NOT the full supply period.
   - "monthlyVolumes": For the "JET A-1 Sales" table, extract EVERY non-zero cell as a separate entry. Each row in the table has 12 month columns (Jan–Dec). For each airport AND each month that has a non-zero value, create one entry: { "month": "YYYY-MM", "airport": "IATA code", "quantity": "value from that cell", "quantityUnit": "m3" }. Example: if LIN has Jan=24.720 and Feb=39.107, create TWO entries: [{ "month":"2025-01", "airport":"LIN", "quantity":"24.720", "quantityUnit":"m3" }, { "month":"2025-02", "airport":"LIN", "quantity":"39.107", "quantityUnit":"m3" }]. IMPORTANT: Include ALL airport rows, even those displayed BELOW the TOTAL row in the table (some PoC documents place airports after the total line). Skip rows labeled "TOTAL". The volumes in this table are total JET A-1 volumes (not SAF) — extract them as-is, the system will normalize to SAF proportionally.
   - "isComplexPoC": "true" if JET A-1 Sales has 3+ airports.
+- HELLENIC FUELS / EKO PoC FORMAT (ISCC EU): These PoC certificates are issued by "EKO AΒEE / HELLENIC FUELS & LUBRICANTS SINGLE MEMBER INDUSTRIAL AND COMMERCIAL SA" (issuer cert number starts with "EU-ISCC-Cert-PL214-..."). The recipient is the airline/operator (e.g. "OK AVIATION WINGS SRO", "AEROWEST GMBH"), NOT a fuel reseller. The product table has these columns: "Type of Product | Type of raw material | Country of origin | Country of biofuel production | Quantity (MT) | GHG Emissions (Eec/Ep/Etd/E-total) | GHG Emissions savings (%) | Energy Content (MJ) | Total Default Values applied | Sustainability criteria | Waste/residue | EU RED Compliant | Chain of Custody | Total Quantity of product delivered (mt)". Mapping rules:
+  - "quantity": value from the "Quantity (MT)" column — this is the SAF-only mass in metric tonnes (typically 0.04–10 MT). DO NOT convert; the backend post-processing handles MT→m3 via density.
+  - "quantityUnit": "MT" (always tonnes for this format).
+  - "totalVolume": value from the rightmost column "Total Quantity of product delivered (mt)" — total blended fuel (jet+SAF) in MT. Will also be auto-converted to m3.
+  - "density": value from the "HEFA DENSITY (MT/M3)" line at the bottom of the document (e.g. 0.765 or 0.780). MUST be extracted — required for unit conversion.
+  - "supplyPeriod": the full date range from the "Date of Dispatch of Sustainable Material" column, kept as printed (e.g. "1/1/2025-31/12/2025").
+  - "coverageGranularity": "year" when the supply period spans a full calendar year (Jan 1 → Dec 31).
+  - "matchingMode": "yearly-pos" when supply period is a full calendar year.
+  - "physicalDeliveryAirport": from "Address of Receipt/receiving point of sustainable material" — extract the ICAO/IATA code (e.g. "Athens Airport,LGAV" → "LGAV").
+  - "deliveryAirports": same single airport (e.g. "LGAV").
+  - "recipient": the airline / operator name from the Recipient column (NOT Hellenic Fuels, which is the supplier/issuer).
+  - "isComplexPoC": "false" — these are simple single-airport single-recipient PoCs even though they're annual.
 - Return ONLY the JSON, no markdown, no explanation.`;
 
 function jsonResponse(body: unknown, status = 200) {
@@ -263,6 +275,24 @@ function detectScopeOverrides(parsed: Record<string, unknown>): Record<string, u
     }
   }
 
+  // Pattern 5: supplyPeriod = full calendar year (e.g. "1/1/2025-31/12/2025").
+  // Used by Hellenic Fuels / EKO ISCC EU PoCs whose additionalInformation/contractNumber
+  // are minimal, but whose Date of Dispatch column shows the full year supply window.
+  if (out.coverageGranularity !== "quarter" && out.coverageGranularity !== "period" && out.coverageGranularity !== "year") {
+    const sp = String(parsed.supplyPeriod ?? "");
+    const fullYear = sp.match(/0?1\/0?1\/(\d{4})\s*[-–—]\s*31\/12\/\1/);
+    if (fullYear) {
+      const yr = parseInt(fullYear[1], 10);
+      out.coverageStart = `${yr}-01-01`;
+      out.coverageEnd = `${yr}-12-31`;
+      out.coverageMonth = `${yr}-12`;
+      out.coverageGranularity = "year";
+      out.matchingMode = "yearly-pos";
+      out.matchingEvidence = "supply-period-full-year";
+      out._scopeOverrideSource = `${out._scopeOverrideSource ?? ""} annual ${yr} (supply period)`.trim();
+    }
+  }
+
   // Pattern 4: Multi-airport in parentheses, e.g. "(IBZ & MAH)" or "(LIN, MXP)"
   // The parenthetical airports are the TRUE delivery scope when the issuance airport is just a logistics hub.
   const multiMatch = addl.match(/\(([A-Z]{3}(?:\s*[&,\/]\s*[A-Z]{3})+)\)/);
@@ -318,6 +348,44 @@ function applyLegacyIataRemap(parsed: Record<string, unknown>): Record<string, u
       .join(", ");
     out.deliveryAirports = remapped;
   }
+  return out;
+}
+
+/**
+ * If quantityUnit is a mass unit (MT/tonne) and a density (MT/m3) is present,
+ * convert quantity (and totalVolume) from mass to volume in m3. The original
+ * mass values are preserved in quantityRawMt / totalVolumeRawMt for audit.
+ *
+ * Used by ISCC EU PoCs from Hellenic Fuels / EKO that print quantities in MT
+ * and the HEFA density on the same document.
+ */
+function normalizeQuantityToM3(parsed: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...parsed };
+  const unit = String(parsed.quantityUnit ?? "").trim().toLowerCase();
+  const isMassUnit = unit === "mt" || unit === "tonne" || unit === "tonnes" || unit === "t";
+  if (!isMassUnit) return out;
+
+  const density = parseFloat(String(parsed.density ?? ""));
+  if (!Number.isFinite(density) || density <= 0) {
+    out._unitConversionWarning = `quantityUnit=${unit} but density is missing/invalid; cannot convert to m3`;
+    return out;
+  }
+
+  const qty = parseFloat(String(parsed.quantity ?? ""));
+  if (Number.isFinite(qty) && qty > 0) {
+    out.quantityRawMt = String(qty);
+    out.quantityRawUnit = parsed.quantityUnit;
+    out.quantity = String(Number((qty / density).toFixed(6)));
+    out.quantityUnit = "m3";
+    out._unitConverted = `MT→m3 via density ${density}`;
+  }
+
+  const totalVol = parseFloat(String(parsed.totalVolume ?? ""));
+  if (Number.isFinite(totalVol) && totalVol > 0) {
+    out.totalVolumeRawMt = String(totalVol);
+    out.totalVolume = String(Number((totalVol / density).toFixed(6)));
+  }
+
   return out;
 }
 
@@ -441,6 +509,13 @@ Deno.serve(async (req) => {
 
     const clean = outputText.replace(/```json|```/g, "").trim();
     let parsed = normalizeCommaDecimals(JSON.parse(clean));
+
+    // Convert mass-unit quantities (MT/tonne) to m3 via density. No-op for m3 inputs.
+    try {
+      parsed = normalizeQuantityToM3(parsed);
+    } catch (e) {
+      parsed._unitConversionError = e instanceof Error ? e.message : String(e);
+    }
 
     // Detect quarter / year / period scope hints in additionalInformation + contractNumber.
     // Defensive: a bad regex / input should NOT crash the whole extraction.

@@ -2798,12 +2798,20 @@ function isSupportedPocCert(cert) {
   return (cert?.document_family || cert?.data?.document_family) === "supported_poc";
 }
 
+function isSupportedYearlyCert(cert) {
+  return (cert?.document_family || cert?.data?.document_family) === "supported_yearly";
+}
+
 function Badge({ status }) {
   const label = String(status || "unknown");
   const map = {
     supported_simple: ["#00ff9d", "#001a0d"],
+    supported_poc: ["#00d4ff", "#001a26"],
+    supported_yearly: ["#a0e030", "#0d1a00"],
     manual_only: ["#ffbb00", "#1a1200"],
     simple_monthly_airport: ["#4a9fd4", "#061423"],
+    simple_yearly_airport: ["#7fbf30", "#0d1a00"],
+    poc_monthly_airport: ["#4ad4c4", "#062321"],
     auto_linked: ["#00ff9d", "#001a0d"],
     partial_linked: ["#ff9933", "#1a0d00"],
     approved: ["#00ff9d", "#001a0d"],
@@ -4594,6 +4602,33 @@ export default function SAFManager({ onLogout, userEmail }) {
     [loadedInvoiceImportId, syncAllocationUnitConsumption, userEmail]
   );
 
+  const runDatabaseYearlyAllocation = useCallback(
+    async (certificate) => {
+      const { data, error } = await supabase.rpc("allocate_yearly_certificate", {
+        p_certificate_id: certificate.id,
+        p_import_id: loadedInvoiceImportId,
+        p_actor: userEmail || null,
+      });
+      if (error) throw error;
+
+      const result = data && typeof data === "object" ? data : {};
+      await syncAllocationUnitConsumption(certificate.id);
+
+      return {
+        status: result.status || "unmatched",
+        match_method: result.match_method || "fifo-yearly-recipient-scoped",
+        cert_volume_m3: normalizeVolumeNumber(result.cert_volume_m3),
+        allocated_volume_m3: normalizeVolumeNumber(result.allocated_volume_m3) || 0,
+        variance_m3: normalizeVolumeNumber(result.variance_m3),
+        review_note: result.review_note || "",
+        candidate_sets: Array.isArray(result.candidate_sets) ? result.candidate_sets : [],
+        linked_rows: Array.isArray(result.linked_rows) ? result.linked_rows : [],
+        diagnostics: result.diagnostics && typeof result.diagnostics === "object" ? result.diagnostics : {},
+      };
+    },
+    [loadedInvoiceImportId, syncAllocationUnitConsumption, userEmail]
+  );
+
   const runDatabasePocAllocation = useCallback(
     async (certificate) => {
       const { data, error } = await supabase.rpc("allocate_poc_certificate", {
@@ -5257,6 +5292,8 @@ export default function SAFManager({ onLogout, userEmail }) {
       try {
         const result = isSupportedPocCert(cert)
           ? await runDatabasePocAllocation(cert)
+          : isSupportedYearlyCert(cert)
+          ? await runDatabaseYearlyAllocation(cert)
           : await runDatabaseSimpleAllocation(cert);
         addLog(
           `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
@@ -5277,12 +5314,12 @@ export default function SAFManager({ onLogout, userEmail }) {
         addLog(`Matching failed for ${certTitle(cert)}: ${error.message}`, "error");
       }
     },
-    [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation]
+    [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation, runDatabaseYearlyAllocation]
   );
 
   const analyzeAll = useCallback(async () => {
     if (!certs.length) return;
-    if (certs.some((cert) => isSupportedSimpleCert(cert) || isSupportedPocCert(cert))) {
+    if (certs.some((cert) => isSupportedSimpleCert(cert) || isSupportedPocCert(cert) || isSupportedYearlyCert(cert))) {
       if (!invoiceRows.length) {
         addLog("No invoice rows are loaded. Import the invoice CSV before matching certificates.", "error");
         return;
@@ -5309,6 +5346,8 @@ export default function SAFManager({ onLogout, userEmail }) {
         try {
           const result = isSupportedPocCert(cert)
             ? await runDatabasePocAllocation(cert)
+            : isSupportedYearlyCert(cert)
+            ? await runDatabaseYearlyAllocation(cert)
             : await runDatabaseSimpleAllocation(cert);
           addLog(
             `${certTitle(cert)} → ${result.status} · ${formatDiagnosticsSummary(result.diagnostics)}`,
@@ -5343,7 +5382,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     } finally {
       setLoading("");
     }
-  }, [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation]);
+  }, [addLog, allocableInvoiceRowCount, certs, invoiceRows.length, loadFromDB, loadedInvoiceImportId, runDatabasePocAllocation, runDatabaseSimpleAllocation, runDatabaseYearlyAllocation]);
 
   const approveCandidate = useCallback(
     async (cert, candidateIndex) => {
@@ -5670,7 +5709,7 @@ export default function SAFManager({ onLogout, userEmail }) {
     totalCerts: certs.length,
     supported: certs.filter((cert) => {
       const fam = cert.document_family || cert.data?.document_family;
-      return fam === "supported_simple" || fam === "supported_poc";
+      return fam === "supported_simple" || fam === "supported_poc" || fam === "supported_yearly";
     }).length,
     manualOnly: certs.filter((cert) => {
       const fam = cert.document_family || cert.data?.document_family;
