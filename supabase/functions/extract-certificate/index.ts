@@ -299,8 +299,15 @@ function detectScopeOverrides(parsed: Record<string, unknown>): Record<string, u
   if (multiMatch) {
     const airports = multiMatch[1].split(/[&,\/]/).map((a) => a.trim().toUpperCase()).filter((a) => /^[A-Z]{3}$/.test(a));
     if (airports.length >= 2) {
-      // If 'Annual' was also detected above, treat the parenthetical airports as the FULL scope.
-      // Replace deliveryAirports + canonicalAirports.
+      // The hub airport from physicalDeliveryAirport is logistics, not legal scope.
+      // Stash it under deliveryHubAirportRaw for audit, then clear so it doesn't get
+      // re-folded into canonicalAirports by the frontend normalizer.
+      const priorHub = String(out.physicalDeliveryAirport ?? parsed.physicalDeliveryAirport ?? "").trim();
+      if (priorHub && !airports.includes(priorHub.toUpperCase())) {
+        out.deliveryHubAirportRaw = priorHub;
+      }
+      out.physicalDeliveryAirport = "";
+      out.physicalDeliveryAirportCanonical = null;
       out.deliveryAirports = airports.join(", ");
       out.canonicalAirports = airports.map((a) => ({ raw: a, iata: a }));
       out._scopeOverrideSource = `${out._scopeOverrideSource ?? ""} multi-airport(${airports.join(",")})`.trim();
@@ -415,7 +422,7 @@ function normalizeCommaDecimals(parsed: Record<string, unknown>) {
 
   const fix = (value: unknown) => {
     if (typeof value !== "string") return value;
-    return value.replace(/^(-?\d+),(\d{1,3})(%?)$/, (_match, integer, decimal, suffix) => `${integer}.${decimal}${suffix}`);
+    return value.replace(/^(-?\d+),(\d{1,9})(%?)$/, (_match, integer, decimal, suffix) => `${integer}.${decimal}${suffix}`);
   };
 
   const out: Record<string, unknown> = { ...parsed };

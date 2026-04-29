@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { supabase } from "./src/supabase.js";
 import { DEFAULT_CERTIFICATE_CLASSIFICATION, deriveCertificateClassification, mergeAirportIdentityEntries } from "./src/certificateClassification.js";
 import { buildCertificateAllocationUnitDrafts, buildNormalizedCertificateView } from "./src/certificateNormalization.js";
@@ -1606,7 +1606,7 @@ function deriveInvoiceYear(parsedCSV) {
 function normalizeCommaDecimals(parsed) {
   const fix = (value) => {
     if (typeof value !== "string") return value;
-    return value.replace(/^(-?\d+),(\d{1,3})(%?)$/, (_, integer, decimal, suffix) => `${integer}.${decimal}${suffix}`);
+    return value.replace(/^(-?\d+),(\d{1,9})(%?)$/, (_, integer, decimal, suffix) => `${integer}.${decimal}${suffix}`);
   };
 
   const out = { ...parsed };
@@ -1679,6 +1679,14 @@ async function extractCertificateFromBase64(base64, filename) {
   }
   if (!data?.parsed) {
     throw new Error(data?.error || "Extraction function returned no parsed certificate.");
+  }
+
+  const warningFields = ["_unitConversionError", "_scopeOverrideError", "_legacyRemapError", "_extractionWarnings"];
+  const warnings = warningFields
+    .filter((field) => data.parsed?.[field])
+    .map((field) => `${field}=${data.parsed[field]}`);
+  if (warnings.length) {
+    throw new Error(`Extraction returned warnings, refusing to save: ${warnings.join(" | ")}`);
   }
 
   return {
@@ -2967,34 +2975,49 @@ function ManualMatchPanel({ cert, invoiceRows, loading, onSave }) {
     setSelectedIds(new Set());
   }, [cert?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const existingLinkRowIds = new Set((cert?.match?.links || []).map((l) => l.invoice_row_id).filter(Boolean));
-
-  const getRowMonth = (row) => {
-    if (!row?.uplift_date) return null;
-    const d = new Date(row.uplift_date);
-    if (isNaN(d)) return null;
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-  };
   const monthNames = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
-  const searchLower = searchText.toLowerCase();
-  const availableRows = (invoiceRows || []).filter((row) => {
-    if (existingLinkRowIds.has(row.id)) return false;
-    if (!(Number(row.remaining_m3) > MATCH_TOLERANCE)) return false;
-    if (airportFilter && row.iata !== airportFilter) return false;
-    if (monthFilter && getRowMonth(row) !== monthFilter) return false;
-    if (supplierFilter && row.supplier !== supplierFilter) return false;
-    if (searchLower && !(row.customer || "").toLowerCase().includes(searchLower) && !(row.invoice_no || "").toLowerCase().includes(searchLower)) return false;
-    return true;
-  });
+  const existingLinkRowIds = useMemo(
+    () => new Set((cert?.match?.links || []).map((l) => l.invoice_row_id).filter(Boolean)),
+    [cert?.match?.links]
+  );
 
-  const uniqueAirports = [...new Set((invoiceRows || []).map((r) => r.iata).filter((a) => a && /^[A-Z]{3,4}$/.test(a)))].sort();
-  const uniqueMonths = [...new Set((invoiceRows || []).map((r) => getRowMonth(r)).filter(Boolean))].sort();
-  const uniqueSuppliers = [...new Set((invoiceRows || []).map((r) => r.supplier).filter(Boolean))].sort();
+  const allocableRows = useMemo(
+    () => (invoiceRows || []).filter((row) => Number(row.remaining_m3) > MATCH_TOLERANCE && !existingLinkRowIds.has(row.id)),
+    [invoiceRows, existingLinkRowIds]
+  );
 
-  const selectedRows = availableRows.filter((r) => selectedIds.has(r.id));
-  const selectedVolume = selectedRows.reduce((sum, r) => sum + (Number(r.remaining_m3) || 0), 0);
-  const projected = existingAllocated + selectedVolume;
+  const uniqueAirports = useMemo(
+    () => [...new Set(allocableRows.map((r) => r.iata).filter((a) => a && /^[A-Z]{3,4}$/.test(a)))].sort(),
+    [allocableRows]
+  );
+  const uniqueMonths = useMemo(
+    () => [...new Set(allocableRows.map((r) => (typeof r.uplift_date === "string" ? r.uplift_date.slice(0, 7) : null)).filter(Boolean))].sort(),
+    [allocableRows]
+  );
+  const uniqueSuppliers = useMemo(
+    () => [...new Set(allocableRows.map((r) => r.supplier).filter(Boolean))].sort(),
+    [allocableRows]
+  );
+
+  const availableRows = useMemo(() => {
+    const searchLower = searchText.toLowerCase();
+    return allocableRows.filter((row) => {
+      if (airportFilter && row.iata !== airportFilter) return false;
+      if (monthFilter && (typeof row.uplift_date !== "string" || row.uplift_date.slice(0, 7) !== monthFilter)) return false;
+      if (supplierFilter && row.supplier !== supplierFilter) return false;
+      if (searchLower && !(row.customer || "").toLowerCase().includes(searchLower) && !(row.invoice_no || "").toLowerCase().includes(searchLower)) return false;
+      return true;
+    });
+  }, [allocableRows, airportFilter, monthFilter, supplierFilter, searchText]);
+
+  const { selectedVolume, projected } = useMemo(() => {
+    let sum = 0;
+    for (const r of availableRows) {
+      if (selectedIds.has(r.id)) sum += Number(r.remaining_m3) || 0;
+    }
+    return { selectedVolume: sum, projected: existingAllocated + sum };
+  }, [availableRows, selectedIds, existingAllocated]);
 
   let volumeColor = "#c8dff0";
   if (selectedVolume > 0) {
@@ -4596,15 +4619,28 @@ export default function SAFManager({ onLogout, userEmail }) {
         );
         const stale = checks.filter(Boolean);
         if (stale.length > 0) {
-          const staleIds = new Set(stale.map((r) => r.id));
           for (const r of stale) {
             addLog(`Client certificate "${r.internal_reference || r.group_key}": PDF missing from storage, clearing stale reference`, "warn");
-            supabase.from("client_certificates").update({ generated_file_path: null }).eq("id", r.id).then(({ error }) => {
-              if (error) addLog(`Failed to clear stale path for ${r.group_key}: ${error.message}`, "error");
-            });
+          }
+          const updates = await Promise.all(
+            stale.map((r) =>
+              supabase
+                .from("client_certificates")
+                .update({ generated_file_path: null })
+                .eq("id", r.id)
+                .then(({ error }) => ({ row: r, error }))
+            )
+          );
+          const cleared = new Set();
+          for (const u of updates) {
+            if (u.error) {
+              addLog(`Failed to clear stale path for ${u.row.group_key}: ${u.error.message}`, "error");
+            } else {
+              cleared.add(u.row.id);
+            }
           }
           for (const r of clientCertRecords) {
-            if (staleIds.has(r.id)) r.generated_file_path = null;
+            if (cleared.has(r.id)) r.generated_file_path = null;
           }
         }
       }
@@ -4728,54 +4764,14 @@ export default function SAFManager({ onLogout, userEmail }) {
     await syncAllocationUnitConsumption(certificateId, null, []);
   }, [syncAllocationUnitConsumption]);
 
-  const insertCertificateInvoiceLinks = useCallback(async (insertedMatchId, certificateId, linkedRows) => {
-    if (!linkedRows.length) return;
-
-    const fullPayload = linkedRows.map((row) => ({
-      certificate_match_id: insertedMatchId,
-      certificate_id: certificateId,
-      invoice_row_id: row.invoice_row_id,
-      row_number: row.row_number,
-      invoice_no: row.invoice_no,
-      customer: row.customer,
-      uplift_date: row.uplift_date,
-      iata: row.iata,
-      icao: row.icao,
-      allocated_m3: row.allocated_m3,
-      allocation_unit_id: row.allocation_unit_id || null,
-      allocation_unit_index: row.allocation_unit_index ?? null,
-      allocation_unit_type: row.allocation_unit_type || null,
-    }));
-
-    let linkRes = await supabase.from("certificate_invoice_links").insert(fullPayload);
-    if (linkRes.error && isMissingColumnError(linkRes.error)) {
-      linkRes = await supabase.from("certificate_invoice_links").insert(
-        linkedRows.map((row) => ({
-          certificate_match_id: insertedMatchId,
-          certificate_id: certificateId,
-          invoice_row_id: row.invoice_row_id,
-          row_number: row.row_number,
-          invoice_no: row.invoice_no,
-          customer: row.customer,
-          uplift_date: row.uplift_date,
-          iata: row.iata,
-          icao: row.icao,
-          allocated_m3: row.allocated_m3,
-        }))
-      );
-    }
-    if (linkRes.error) throw linkRes.error;
-  }, []);
-
   const persistMatch = useCallback(
     async (certificate, result, reviewer, options = {}) => {
-      const { skipClear = false, skipAllocationSync = false } = options;
-      if (!skipClear) {
-        await clearCertificateMatch(certificate.id);
-      }
+      const { skipAllocationSync = false } = options;
 
+      const reviewedAt = reviewer && (result.status === "approved" || result.status === "rejected")
+        ? new Date().toISOString()
+        : null;
       const matchPayload = {
-        certificate_id: certificate.id,
         status: result.status,
         match_method: result.match_method,
         cert_volume_m3: result.cert_volume_m3,
@@ -4783,31 +4779,38 @@ export default function SAFManager({ onLogout, userEmail }) {
         variance_m3: result.variance_m3,
         review_note: result.review_note,
         reviewed_by: reviewer || null,
-        reviewed_at: reviewer && (result.status === "approved" || result.status === "rejected") ? new Date().toISOString() : null,
+        reviewed_at: reviewedAt,
         candidate_sets: result.candidate_sets || [],
         diagnostics: result.diagnostics || {},
-        updated_at: new Date().toISOString(),
       };
 
-      let insertRes = await supabase.from("certificate_matches").insert(matchPayload).select("*").single();
-      if (insertRes.error && /diagnostics/i.test(insertRes.error.message || "")) {
-        const { diagnostics: _ignoredDiagnostics, ...fallbackPayload } = matchPayload;
-        insertRes = await supabase.from("certificate_matches").insert(fallbackPayload).select("*").single();
-      }
+      const linkPayload = (result.linked_rows || []).map((row) => ({
+        invoice_row_id: row.invoice_row_id,
+        row_number: row.row_number,
+        invoice_no: row.invoice_no,
+        customer: row.customer,
+        uplift_date: row.uplift_date,
+        iata: row.iata,
+        icao: row.icao,
+        allocated_m3: row.allocated_m3,
+        allocation_unit_id: row.allocation_unit_id || null,
+        allocation_unit_index: row.allocation_unit_index ?? null,
+        allocation_unit_type: row.allocation_unit_type || null,
+      }));
 
-      const { data: insertedMatch, error: matchErr } = insertRes;
-      if (matchErr) throw matchErr;
-
-      const linkedRows = result.linked_rows || [];
-      if (linkedRows.length) {
-        await insertCertificateInvoiceLinks(insertedMatch.id, certificate.id, linkedRows);
-      }
+      const { error: rpcErr } = await supabase.rpc("upsert_certificate_match", {
+        p_certificate_id: certificate.id,
+        p_match: matchPayload,
+        p_links: linkPayload,
+        p_mode: "replace",
+      });
+      if (rpcErr) throw rpcErr;
 
       if (!skipAllocationSync) {
         await syncAllocationUnitConsumption(certificate.id);
       }
     },
-    [clearCertificateMatch, insertCertificateInvoiceLinks, syncAllocationUnitConsumption]
+    [syncAllocationUnitConsumption]
   );
 
   const saveManualMatch = useCallback(
@@ -4900,21 +4903,35 @@ export default function SAFManager({ onLogout, userEmail }) {
             userEmail
           );
         } else {
-          await insertCertificateInvoiceLinks(existingMatch.id, certificate.id, newLinkedRows);
-          const { error: updErr } = await supabase
-            .from("certificate_matches")
-            .update({
-              status: nextStatus,
-              match_method: "manual",
-              allocated_volume_m3: newAllocated,
-              variance_m3: variance,
-              review_note: note,
-              reviewed_by: userEmail || null,
-              reviewed_at: nextStatus === "approved" ? new Date().toISOString() : null,
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", existingMatch.id);
-          if (updErr) throw updErr;
+          const appendPayload = {
+            status: nextStatus,
+            match_method: "manual",
+            allocated_volume_m3: newAllocated,
+            variance_m3: variance,
+            review_note: note,
+            reviewed_by: userEmail || null,
+            reviewed_at: nextStatus === "approved" ? new Date().toISOString() : null,
+          };
+          const linkPayload = newLinkedRows.map((row) => ({
+            invoice_row_id: row.invoice_row_id,
+            row_number: row.row_number,
+            invoice_no: row.invoice_no,
+            customer: row.customer,
+            uplift_date: row.uplift_date,
+            iata: row.iata,
+            icao: row.icao,
+            allocated_m3: row.allocated_m3,
+            allocation_unit_id: row.allocation_unit_id || null,
+            allocation_unit_index: row.allocation_unit_index ?? null,
+            allocation_unit_type: row.allocation_unit_type || null,
+          }));
+          const { error: appendErr } = await supabase.rpc("upsert_certificate_match", {
+            p_certificate_id: certificate.id,
+            p_match: appendPayload,
+            p_links: linkPayload,
+            p_mode: "append",
+          });
+          if (appendErr) throw appendErr;
           await syncAllocationUnitConsumption(certificate.id);
         }
 
@@ -4924,7 +4941,9 @@ export default function SAFManager({ onLogout, userEmail }) {
             supabase.rpc("sync_allocation_units_consumed"),
             supabase.rpc("sync_no_uplift_exclusions"),
           ]);
-        } catch (syncErr) { /* best-effort */ }
+        } catch (syncErr) {
+          addLog(`Reconciliation RPC failed: ${syncErr.message}. Invoice flags / unit consumption / no-uplift exclusions may be stale — reload or re-run Match All.`, "error");
+        }
         const clipNotice = clippedRowNumber !== null
           ? ` Row ${clippedRowNumber} clipped by ${clippedDelta.toFixed(3)} m³ to fit cert capacity.`
           : "";
@@ -4937,7 +4956,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         setLoading("");
       }
     },
-    [invoiceRows, loading, addLog, persistMatch, insertCertificateInvoiceLinks, syncAllocationUnitConsumption, userEmail, loadFromDB]
+    [invoiceRows, loading, addLog, persistMatch, syncAllocationUnitConsumption, userEmail, loadFromDB]
   );
 
   const handlePDFUpload = useCallback(
@@ -5317,6 +5336,10 @@ export default function SAFManager({ onLogout, userEmail }) {
       addLog(`Re-extracting ${cert.pdfPath}`, "info");
 
       try {
+        if (cert?.match?.id) {
+          await clearCertificateMatch(cert.id);
+          addLog(`Cleared previous match for ${certTitle(cert)} — re-run Match All after re-extract.`, "info");
+        }
         const { data: blob, error: dlErr } = await supabase.storage.from("certificates-pdf").download(cert.pdfPath);
         if (dlErr) throw dlErr;
         const base64 = await blobToBase64(blob);
@@ -5366,7 +5389,7 @@ export default function SAFManager({ onLogout, userEmail }) {
         addLog(`Re-extract failed: ${error.message}`, "error");
       }
     },
-    [addLog, certs, loadFromDB, syncCertificateAllocationUnits]
+    [addLog, certs, clearCertificateMatch, loadFromDB, syncCertificateAllocationUnits]
   );
 
   const analyzeSingle = useCallback(
@@ -5408,7 +5431,9 @@ export default function SAFManager({ onLogout, userEmail }) {
             supabase.rpc("sync_allocation_units_consumed"),
             supabase.rpc("sync_no_uplift_exclusions"),
           ]);
-        } catch (syncErr) { /* best-effort */ }
+        } catch (syncErr) {
+          addLog(`Reconciliation RPC failed: ${syncErr.message}. Invoice flags / unit consumption / no-uplift exclusions may be stale — reload or re-run Match All.`, "error");
+        }
         await loadFromDB();
         setTab("certs");
       } catch (error) {
