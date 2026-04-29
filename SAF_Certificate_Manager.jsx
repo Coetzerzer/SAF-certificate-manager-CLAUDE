@@ -3187,13 +3187,14 @@ function monthFromPeriodStart(value) {
   return m ? `${m[1]}-${m[2]}` : null;
 }
 
-const IATA_TEXT_DENYLIST = new Set(["SAF", "PDA", "FIFO", "POC", "POS", "UCO", "USA", "CSV", "PDF", "API"]);
+const IATA_TEXT_DENYLIST = new Set(["SAF", "PDA", "FIFO", "POC", "POS", "UCO", "USA", "CSV", "PDF", "API", "ROW", "ALL", "NEW", "ANY", "LOG", "DUP", "AUTO"]);
 function extractIataFromText(value) {
   if (typeof value !== "string" || !value) return null;
-  const matches = value.toUpperCase().match(/\b[A-Z]{3}\b/g);
+  const matches = value.toUpperCase().match(/\b[A-Z]{3,4}\b/g);
   if (!matches) return null;
   for (const m of matches) {
-    if (!IATA_TEXT_DENYLIST.has(m)) return m;
+    if (IATA_TEXT_DENYLIST.has(m)) continue;
+    return m;
   }
   return null;
 }
@@ -3201,15 +3202,18 @@ function extractIataFromText(value) {
 function pickCertAirport(cert) {
   const data = cert?.data || {};
   const match = cert?.match || null;
+  const diag = match?.diagnostics || null;
   const candidates = [
     data?.canonicalAirports?.[0]?.iata,
+    data?.canonicalAirports?.[0]?.icao,
     data?.physicalDeliveryAirportCanonical?.iata,
-    Array.isArray(match?.diagnostics?.iata_codes) ? match.diagnostics.iata_codes[0] : null,
+    data?.physicalDeliveryAirportCanonical?.icao,
+    Array.isArray(diag?.iata_codes) ? diag.iata_codes[0] : null,
+    Array.isArray(diag?.icao_codes) ? diag.icao_codes[0] : null,
     data?.airportVolumes?.[0]?.airportCanonical?.iata,
     data?.monthlyVolumes?.[0]?.airportCanonical?.iata,
     extractIataFromText(data?.physicalDeliveryAirport),
     extractIataFromText(data?.deliveryAirports),
-    extractIataFromText(match?.review_note),
   ];
   for (const value of candidates) {
     if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
@@ -3567,10 +3571,15 @@ function buildCertDetailData(certs, invoiceRows) {
   }
   result.sort((a, b) => a.airport.localeCompare(b.airport) || a.month.localeCompare(b.month) || b.gap - a.gap);
 
-  // Mark exact duplicates: same airport + month + volume
+  // Mark exact duplicates: same airport + month + volume + recipient.
+  // Recipient is included so distinct certs with the same airport/month/volume
+  // (common for yearly Hellenic Fuels PoCs) aren't flagged as duplicates.
+  // Skip rows with sentinel airport/month — we can't reliably detect dups there.
   const seen = new Map();
   for (const row of result) {
-    const dupKey = `${row.airport}|${row.month}|${row.certVolume.toFixed(3)}`;
+    if (row.airport === "???" || row.month === "???") continue;
+    const recipient = String(row.cert?.data?.recipient || "").trim().toLowerCase();
+    const dupKey = `${row.airport}|${row.month}|${row.certVolume.toFixed(3)}|${recipient}`;
     if (seen.has(dupKey)) {
       row.isDuplicate = true;
       seen.get(dupKey).isDuplicate = true;
