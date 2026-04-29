@@ -351,13 +351,18 @@ function applyLegacyIataRemap(parsed: Record<string, unknown>): Record<string, u
   return out;
 }
 
+// Fixed conversion factor used internally to keep certificate volumes aligned with the invoice CSV
+// pipeline, which calculates m3 = MT × 1.25 (i.e. assumes density 0.80 MT/m3). The PDF density
+// is still extracted and preserved as `densityFromPdf` for audit, but is NOT used for conversion.
+const FIXED_MT_TO_M3_MULTIPLIER = 1.25;
+
 /**
- * If quantityUnit is a mass unit (MT/tonne) and a density (MT/m3) is present,
- * convert quantity (and totalVolume) from mass to volume in m3. The original
- * mass values are preserved in quantityRawMt / totalVolumeRawMt for audit.
+ * If quantityUnit is a mass unit (MT/tonne), convert quantity (and totalVolume) from mass to
+ * volume in m3 using the fixed multiplier × 1.25 (matches the CSV pipeline). The original
+ * mass values are preserved in quantityRawMt / totalVolumeRawMt and the PDF-stated density
+ * in densityFromPdf — both for audit only.
  *
- * Used by ISCC EU PoCs from Hellenic Fuels / EKO that print quantities in MT
- * and the HEFA density on the same document.
+ * Used by ISCC EU PoCs from Hellenic Fuels / EKO that print quantities in MT.
  */
 function normalizeQuantityToM3(parsed: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...parsed };
@@ -365,25 +370,25 @@ function normalizeQuantityToM3(parsed: Record<string, unknown>): Record<string, 
   const isMassUnit = unit === "mt" || unit === "tonne" || unit === "tonnes" || unit === "t";
   if (!isMassUnit) return out;
 
-  const density = parseFloat(String(parsed.density ?? ""));
-  if (!Number.isFinite(density) || density <= 0) {
-    out._unitConversionWarning = `quantityUnit=${unit} but density is missing/invalid; cannot convert to m3`;
-    return out;
+  // Preserve PDF-extracted density for audit even though we don't use it for conversion.
+  const pdfDensity = parseFloat(String(parsed.density ?? ""));
+  if (Number.isFinite(pdfDensity) && pdfDensity > 0) {
+    out.densityFromPdf = String(pdfDensity);
   }
 
   const qty = parseFloat(String(parsed.quantity ?? ""));
   if (Number.isFinite(qty) && qty > 0) {
     out.quantityRawMt = String(qty);
     out.quantityRawUnit = parsed.quantityUnit;
-    out.quantity = String(Number((qty / density).toFixed(6)));
+    out.quantity = String(Number((qty * FIXED_MT_TO_M3_MULTIPLIER).toFixed(6)));
     out.quantityUnit = "m3";
-    out._unitConverted = `MT→m3 via density ${density}`;
+    out._unitConverted = `MT→m3 via fixed × ${FIXED_MT_TO_M3_MULTIPLIER}`;
   }
 
   const totalVol = parseFloat(String(parsed.totalVolume ?? ""));
   if (Number.isFinite(totalVol) && totalVol > 0) {
     out.totalVolumeRawMt = String(totalVol);
-    out.totalVolume = String(Number((totalVol / density).toFixed(6)));
+    out.totalVolume = String(Number((totalVol * FIXED_MT_TO_M3_MULTIPLIER).toFixed(6)));
   }
 
   return out;
