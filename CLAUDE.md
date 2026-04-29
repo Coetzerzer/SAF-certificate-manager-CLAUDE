@@ -68,7 +68,7 @@ This is a single-file React application (`SAF_Certificate_Manager.jsx`) with no 
 - `invoice_rows`: `id, import_id, row_number, invoice_no, customer, uplift_date, flight_no, delivery_ticket, iata, icao, country, supplier, vol_m3, saf_vol_m3, is_allocated, is_duplicate, duplicate_group_key, validation_note, raw_payload (jsonb)`
 - `certificate_matches`: `id, certificate_id, status, match_method, cert_volume_m3, allocated_volume_m3, variance_m3, review_note, reviewed_by, reviewed_at, candidate_sets (jsonb), diagnostics (jsonb), created_at, updated_at`
 - `certificate_invoice_links`: `id, certificate_match_id, certificate_id, invoice_row_id, row_number, invoice_no, customer, uplift_date, iata, icao, allocated_m3, allocation_unit_id, allocation_unit_index, allocation_unit_type`
-- `certificate_allocation_units`: `id, certificate_id, unit_index, unit_type, airport_code, month, saf_volume_m3, consumed_volume_m3, remaining_volume_m3`
+- `certificate_allocation_units`: `id, certificate_id, unit_index, unit_type, airport_iata, airport_icao, airport_name, period_start, period_end, dispatch_date, saf_volume_m3, jet_volume_m3, source_reference, matching_mode_override, review_required, normalization_warning, consumed_volume_m3, remaining_volume_m3` (full schema in `supabase/migrations/20260326_certificate_allocation_units.sql`)
 - `client_certificates`: `id, group_key (unique), client_name, airport_code, month, total_saf_volume_m3, source_certificate_refs, generated_file_path, issue_date, internal_reference`
 - `invoices` (legacy): `id, filename, csv_path, created_at`
 

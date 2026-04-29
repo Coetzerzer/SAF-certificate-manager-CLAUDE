@@ -3187,6 +3187,57 @@ function monthFromPeriodStart(value) {
   return m ? `${m[1]}-${m[2]}` : null;
 }
 
+const IATA_TEXT_DENYLIST = new Set(["SAF", "PDA", "FIFO", "POC", "POS", "UCO", "USA", "CSV", "PDF", "API"]);
+function extractIataFromText(value) {
+  if (typeof value !== "string" || !value) return null;
+  const matches = value.toUpperCase().match(/\b[A-Z]{3}\b/g);
+  if (!matches) return null;
+  for (const m of matches) {
+    if (!IATA_TEXT_DENYLIST.has(m)) return m;
+  }
+  return null;
+}
+
+function pickCertAirport(cert) {
+  const data = cert?.data || {};
+  const match = cert?.match || null;
+  const candidates = [
+    data?.canonicalAirports?.[0]?.iata,
+    data?.physicalDeliveryAirportCanonical?.iata,
+    Array.isArray(match?.diagnostics?.iata_codes) ? match.diagnostics.iata_codes[0] : null,
+    data?.airportVolumes?.[0]?.airportCanonical?.iata,
+    data?.monthlyVolumes?.[0]?.airportCanonical?.iata,
+    extractIataFromText(data?.physicalDeliveryAirport),
+    extractIataFromText(data?.deliveryAirports),
+    extractIataFromText(match?.review_note),
+  ];
+  for (const value of candidates) {
+    if (typeof value === "string" && value.trim()) return value.trim().toUpperCase();
+  }
+  return "???";
+}
+
+function pickAllocationUnitForRow(units, row) {
+  if (!Array.isArray(units) || !units.length || !row) return null;
+  const rowIata = String(row.iata || "").toUpperCase();
+  const rowIcao = String(row.icao || "").toUpperCase();
+  const rowDate = typeof row.uplift_date === "string" ? row.uplift_date.slice(0, 10) : "";
+  if (!rowDate) return null;
+  for (const unit of units) {
+    const unitIata = String(unit.airport_iata || "").toUpperCase();
+    const unitIcao = String(unit.airport_icao || "").toUpperCase();
+    const airportMatch =
+      (unitIata && rowIata && unitIata === rowIata) ||
+      (unitIcao && rowIcao && unitIcao === rowIcao);
+    if (!airportMatch) continue;
+    const periodStart = typeof unit.period_start === "string" ? unit.period_start.slice(0, 10) : "";
+    const periodEnd = typeof unit.period_end === "string" ? unit.period_end.slice(0, 10) : "";
+    if (!periodStart || !periodEnd) continue;
+    if (rowDate >= periodStart && rowDate <= periodEnd) return unit;
+  }
+  return null;
+}
+
 function deriveUnitStatus(certVol, allocVol, parentStatus, excludedNoUplift) {
   if (excludedNoUplift) return "no_uplift";
   if (certVol <= 0) return parentStatus || "no_match";
@@ -3259,16 +3310,20 @@ function buildDashboardData(certs, invoiceRows) {
         addToGrid(airport, month, uCertVol, uAllocVol, unitStatus, cert, excluded);
       }
     } else {
-      const canonicalAirports = cert.data?.canonicalAirports || [];
-      const airportCode = canonicalAirports[0]?.iata || "???";
-      const month = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
+      const isYearly = (cert.document_family || cert.data?.document_family) === "supported_yearly";
+      const airportCode = pickCertAirport(cert);
+      const month = isYearly
+        ? "ANNUAL"
+        : (cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???");
       addToGrid(airportCode, month, certVol, allocVol, status, cert, false);
     }
 
-    // Alerts (cert-level, unchanged)
-    const canonicalAirports = cert.data?.canonicalAirports || [];
-    const primaryAirport = canonicalAirports[0]?.iata || "???";
-    const primaryMonth = cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???";
+    // Alerts (cert-level)
+    const isYearlyCert = (cert.document_family || cert.data?.document_family) === "supported_yearly";
+    const primaryAirport = pickCertAirport(cert);
+    const primaryMonth = isYearlyCert
+      ? "ANNUAL"
+      : (cert.data?.coverageMonth || match.diagnostics?.coverage_month || "???");
     if (certVol > 50) {
       alerts.push({ type: "volume", cert, message: `${primaryAirport} ${primaryMonth}: volume ${certVol.toFixed(1)} m³ exceeds plausibility threshold` });
     }
@@ -3484,8 +3539,9 @@ function buildCertDetailData(certs, invoiceRows) {
         });
       }
     } else {
-      const airport = cert.data?.canonicalAirports?.[0]?.iata || "???";
-      const month = cert.data?.coverageMonth || "???";
+      const isYearly = (cert.document_family || cert.data?.document_family) === "supported_yearly";
+      const airport = pickCertAirport(cert);
+      const month = isYearly ? "ANNUAL" : (cert.data?.coverageMonth || "???");
       const pool = invoicePools.get(`${airport}|${month}`);
       const certVol = Number(cert.match?.cert_volume_m3) || 0;
       const allocVol = Number(cert.match?.allocated_volume_m3) || 0;
@@ -4755,21 +4811,28 @@ export default function SAFManager({ onLogout, userEmail }) {
       setLoading("Saving manual match...");
       try {
         const idSet = new Set(selectedRowIds);
+        const certUnits = Array.isArray(certificate.allocation_units) ? certificate.allocation_units : [];
+        // Only resolve unit ids for multi-unit certs (PoC complexes). Single-unit certs rely on
+        // the fallback in hydrateAllocationUnitsWithConsumption, which requires ALL links to be null.
+        const shouldPickUnit = certUnits.length > 1;
         const newLinkedRows = invoiceRows
           .filter((r) => idSet.has(r.id) && Number(r.remaining_m3) > MATCH_TOLERANCE)
-          .map((r) => ({
-            invoice_row_id: r.id,
-            row_number: r.row_number,
-            invoice_no: r.invoice_no,
-            customer: r.customer,
-            uplift_date: r.uplift_date,
-            iata: r.iata,
-            icao: r.icao,
-            allocated_m3: Number(r.remaining_m3),
-            allocation_unit_id: null,
-            allocation_unit_index: null,
-            allocation_unit_type: null,
-          }));
+          .map((r) => {
+            const unit = shouldPickUnit ? pickAllocationUnitForRow(certUnits, r) : null;
+            return {
+              invoice_row_id: r.id,
+              row_number: r.row_number,
+              invoice_no: r.invoice_no,
+              customer: r.customer,
+              uplift_date: r.uplift_date,
+              iata: r.iata,
+              icao: r.icao,
+              allocated_m3: Number(r.remaining_m3),
+              allocation_unit_id: unit?.id || null,
+              allocation_unit_index: unit?.unit_index ?? null,
+              allocation_unit_type: unit?.unit_type || null,
+            };
+          });
 
         if (!newLinkedRows.length) {
           addLog("No selectable invoice rows with remaining volume.", "error");
@@ -4826,6 +4889,13 @@ export default function SAFManager({ onLogout, userEmail }) {
           await syncAllocationUnitConsumption(certificate.id);
         }
 
+        try {
+          await Promise.all([
+            supabase.rpc("sync_invoice_allocation_flags"),
+            supabase.rpc("sync_allocation_units_consumed"),
+            supabase.rpc("sync_no_uplift_exclusions"),
+          ]);
+        } catch (syncErr) { /* best-effort */ }
         addLog(`Manual match saved: ${newLinkedRows.length} row(s), ${manuallyAdded.toFixed(3)} m³ linked (status: ${nextStatus}).`, "ok");
         await loadFromDB();
       } catch (err) {
