@@ -91,8 +91,8 @@ function slugify(value) {
 function buildInternalReference({ clientName, airportCode, month, issueDate }) {
   const monthPart = String(month ?? "").replace("-", "");
   const datePart = String(issueDate ?? "").replace(/-/g, "");
-  const clientPart = slugify(clientName).slice(0, 14) || "CLIENT";
-  const airportPart = slugify(airportCode).slice(0, 6) || "AIRPORT";
+  const clientPart = slugify(clientName).slice(0, 32) || "CLIENT";
+  const airportPart = slugify(airportCode).slice(0, 8) || "AIRPORT";
   return `TITA-${monthPart}-${airportPart}-${clientPart}-${datePart}`;
 }
 
