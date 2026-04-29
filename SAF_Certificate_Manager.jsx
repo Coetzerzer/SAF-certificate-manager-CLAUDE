@@ -4815,24 +4815,44 @@ export default function SAFManager({ onLogout, userEmail }) {
         // Only resolve unit ids for multi-unit certs (PoC complexes). Single-unit certs rely on
         // the fallback in hydrateAllocationUnitsWithConsumption, which requires ALL links to be null.
         const shouldPickUnit = certUnits.length > 1;
-        const newLinkedRows = invoiceRows
-          .filter((r) => idSet.has(r.id) && Number(r.remaining_m3) > MATCH_TOLERANCE)
-          .map((r) => {
-            const unit = shouldPickUnit ? pickAllocationUnitForRow(certUnits, r) : null;
-            return {
-              invoice_row_id: r.id,
-              row_number: r.row_number,
-              invoice_no: r.invoice_no,
-              customer: r.customer,
-              uplift_date: r.uplift_date,
-              iata: r.iata,
-              icao: r.icao,
-              allocated_m3: Number(r.remaining_m3),
-              allocation_unit_id: unit?.id || null,
-              allocation_unit_index: unit?.unit_index ?? null,
-              allocation_unit_type: unit?.unit_type || null,
-            };
+
+        const certCapacity = Number(certificate.data?.quantity) || Number(certificate.match?.cert_volume_m3) || 0;
+        const priorAllocated = Number(certificate.match?.allocated_volume_m3) || 0;
+        let remainingCap = Number((certCapacity - priorAllocated).toFixed(6));
+
+        const selectedRows = invoiceRows.filter(
+          (r) => idSet.has(r.id) && Number(r.remaining_m3) > MATCH_TOLERANCE
+        );
+
+        const newLinkedRows = [];
+        let clippedRowNumber = null;
+        let clippedDelta = 0;
+
+        for (const r of selectedRows) {
+          if (remainingCap <= MATCH_TOLERANCE) break;
+          const want = Number(r.remaining_m3);
+          const give = Number(Math.min(want, remainingCap).toFixed(6));
+          if (give <= 0) continue;
+          if (give < want) {
+            clippedRowNumber = r.row_number;
+            clippedDelta = Number((want - give).toFixed(6));
+          }
+          const unit = shouldPickUnit ? pickAllocationUnitForRow(certUnits, r) : null;
+          newLinkedRows.push({
+            invoice_row_id: r.id,
+            row_number: r.row_number,
+            invoice_no: r.invoice_no,
+            customer: r.customer,
+            uplift_date: r.uplift_date,
+            iata: r.iata,
+            icao: r.icao,
+            allocated_m3: give,
+            allocation_unit_id: unit?.id || null,
+            allocation_unit_index: unit?.unit_index ?? null,
+            allocation_unit_type: unit?.unit_type || null,
           });
+          remainingCap = Number((remainingCap - give).toFixed(6));
+        }
 
         if (!newLinkedRows.length) {
           addLog("No selectable invoice rows with remaining volume.", "error");
@@ -4896,7 +4916,10 @@ export default function SAFManager({ onLogout, userEmail }) {
             supabase.rpc("sync_no_uplift_exclusions"),
           ]);
         } catch (syncErr) { /* best-effort */ }
-        addLog(`Manual match saved: ${newLinkedRows.length} row(s), ${manuallyAdded.toFixed(3)} m³ linked (status: ${nextStatus}).`, "ok");
+        const clipNotice = clippedRowNumber !== null
+          ? ` Row ${clippedRowNumber} clipped by ${clippedDelta.toFixed(3)} m³ to fit cert capacity.`
+          : "";
+        addLog(`Manual match saved: ${newLinkedRows.length} row(s), ${manuallyAdded.toFixed(3)} m³ linked (status: ${nextStatus}).${clipNotice}`, "ok");
         await loadFromDB();
       } catch (err) {
         console.error(err);
